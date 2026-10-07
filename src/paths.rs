@@ -25,7 +25,7 @@ const APP: &str = "omaread";
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
-    /// Directory holding the journal files. One file per machine.
+    /// Directory holding the journal. One local file, the source of truth.
     pub journal_dir: Option<PathBuf>,
     /// Maximum reading width in columns. `None` uses the full window.
     pub max_width: Option<u16>,

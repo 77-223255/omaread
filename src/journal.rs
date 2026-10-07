@@ -1,9 +1,8 @@
-//! The journal: append-only event log, one file per machine.
+//! The journal: append-only event log, one local file.
 //!
 //! The journal is the source of truth. Everything else, including the reading
-//! position the reader shows, is folded out of it. Each machine writes only its
-//! own file, so two machines syncing through a shared folder can never write the
-//! same file and no conflict copies appear.
+//! position the reader shows, is folded out of it. It lives on one machine and
+//! is not meant to be shared: it is folded in place as it grows.
 //!
 //! Events are JSON, one per line, so a partly written last line costs at most
 //! one event and never the file.
@@ -238,8 +237,7 @@ impl BookRecord {
 }
 
 impl State {
-    /// The last known position of a book. Where two machines disagree, the newer
-    /// timestamp wins.
+    /// The last known position of a book.
     pub fn position(&self, book: &BookId) -> Option<&Locator> {
         self.positions.get(book).map(|p| &p.locator)
     }
@@ -384,13 +382,13 @@ impl Journal {
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         // What somebody has read and where they stopped is theirs, and the
-        // directory may have been made by an older version, by hand, or by a
-        // sync tool: permissions are tightened every time, not only when this
-        // program created the directory.
+        // directory may have been made by an older version or by hand:
+        // permissions are tightened every time, not only when this program
+        // created the directory.
         let _ = std::fs::set_permissions(dir, Permissions::from_mode(0o700));
-        // Every journal in the directory, not only this machine's own: a
-        // `journal-<otherhost>.jsonl` synced in from elsewhere holds the same
-        // reading positions and is private the same way.
+        // Every journal in the directory, not only the one in use: a
+        // `journal-<host>.jsonl` from an older version holds the same reading
+        // positions and is private the same way.
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 if entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl") {
@@ -477,11 +475,10 @@ impl Journal {
             .open(&self.own_file)
             .with_context(|| format!("cannot append to {}", self.own_file.display()))?;
         // One write, the whole line with its newline. Two processes appending to
-        // one journal — a reader and a `set` in another shell, or the same library
-        // on two machines — must not interleave *inside* a line, or the file the
-        // library is rebuilt from grows lines nobody can read and the events they
-        // held are gone without a word. `writeln!` may issue more than one write;
-        // this cannot.
+        // one journal — a reader and a `set` in another shell — must not
+        // interleave *inside* a line, or the file the library is rebuilt from
+        // grows lines nobody can read and the events they held are gone without a
+        // word. `writeln!` may issue more than one write; this cannot.
         let mut bytes = line.into_bytes();
         bytes.push(b'\n');
         file.write_all(&bytes)?;
@@ -949,11 +946,11 @@ mod tests {
 
     #[test]
     fn an_event_that_could_not_have_come_from_here_is_not_believed() {
-        // The journal is a file on disk, and it may sit in a folder two machines
-        // write to. A line naming a book that is not a content hash, or a book at
-        // a path that is not absolute, could not have been written by this
-        // program: believing it would put a book nobody has into the library,
-        // pointing wherever the line said.
+        // The journal is a file on disk, possibly edited by hand. A line naming a
+        // book that is not a content hash, or a book at a path that is not
+        // absolute, could not have been written by this program: believing it
+        // would put a book nobody has into the library, pointing wherever the line
+        // said.
         let dir = scratch("implausible");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("journal-box.jsonl");
