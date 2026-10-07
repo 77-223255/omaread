@@ -113,10 +113,7 @@ static ZH: &[(&str, &str)] = &[
     ("filter cleared", "已清除筛选"),
     ("clear the filter", "清除筛选"),
     ("open the book", "打开这本书"),
-    (
-        "cycle the order: title, author, series",
-        "切换排序：标题、作者、系列",
-    ),
+    ("cycle the order: title, author", "切换排序：标题、作者"),
     ("down, up", "下、上"),
     ("first, last", "首、尾"),
     ("page down, up", "翻页下、上"),
@@ -274,11 +271,7 @@ mod tests {
         }
         // The order is looked up with a value the source scan cannot see, so it
         // is checked against the things that produce the values.
-        for order in [
-            crate::library::Order::Title,
-            crate::library::Order::Author,
-            crate::library::Order::Series,
-        ] {
+        for order in [crate::library::Order::Title, crate::library::Order::Author] {
             checked += 1;
             if translated(order.label()).is_none() {
                 missing.push(order.label().to_string());

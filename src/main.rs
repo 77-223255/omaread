@@ -72,6 +72,12 @@ enum Command {
         #[arg(long, value_name = "TEXT")]
         filter: Option<String>,
     },
+    /// The distinct author names, and how many books each is on
+    Authors {
+        /// Print JSON rather than a table, for a program
+        #[arg(long)]
+        json: bool,
+    },
     /// Add the books of a directory to the library, and notice moved ones
     Scan {
         /// The directory to look through, and everything below it
@@ -101,6 +107,22 @@ enum Command {
         /// A book id, or the name the library knows the book by
         #[arg(value_name = "BOOK")]
         book: String,
+        /// Print the corrected book as JSON, for a program
+        #[arg(long)]
+        json: bool,
+        /// title=… authors=a,b series=… series-index=… tags=a,b rating=1-5
+        /// publisher=… year=… language=… An empty value clears the field
+        #[arg(value_name = "FIELD=VALUE", required = true)]
+        fields: Vec<String>,
+    },
+    /// Correct every book a word picks out, in one call
+    Edit {
+        /// The word that picks the books out: a title, an author, a series, a tag
+        #[arg(value_name = "TEXT")]
+        filter: String,
+        /// Print the corrected books as JSON, for a program
+        #[arg(long)]
+        json: bool,
         /// title=… authors=a,b series=… series-index=… tags=a,b rating=1-5
         /// publisher=… year=… language=… An empty value clears the field
         #[arg(value_name = "FIELD=VALUE", required = true)]
@@ -115,6 +137,9 @@ enum Command {
         /// A book id, a name, a file, or a directory of them
         #[arg(value_name = "BOOK")]
         what: String,
+        /// Print the forgotten books as JSON, for a program
+        #[arg(long)]
+        json: bool,
     },
     /// Write the library as Markdown, one file per chapter
     Export {
@@ -159,10 +184,10 @@ enum Command {
 #[derive(Debug, Default)]
 struct Fields {
     title: Option<String>,
-    authors: Option<String>,
+    authors: Option<Vec<String>>,
     series: Option<String>,
     series_index: Option<f32>,
-    tags: Option<String>,
+    tags: Option<Vec<String>>,
     rating: Option<u8>,
     publisher: Option<String>,
     year: Option<i32>,
@@ -189,14 +214,14 @@ impl Fields {
             }
             match name.trim() {
                 "title" => fields.title = Some(value.to_string()),
-                "authors" => fields.authors = Some(value.to_string()),
+                "authors" => fields.authors = Some(parse_list(value)?),
                 "series" => fields.series = Some(value.to_string()),
                 "series-index" => {
                     fields.series_index = Some(value.trim().parse().with_context(|| {
                         format!("{value:?} is not a number to sit at in a series")
                     })?)
                 }
-                "tags" => fields.tags = Some(value.to_string()),
+                "tags" => fields.tags = Some(parse_list(value)?),
                 "rating" => {
                     let rating: u8 = value
                         .trim()
@@ -239,6 +264,21 @@ impl Fields {
             && self.year.is_none()
             && self.language.is_none()
     }
+
+    /// What the journal records for this correction.
+    fn changes(&self) -> Payload {
+        Payload::MetadataSet {
+            title: self.title.clone(),
+            authors: self.authors.clone(),
+            series: self.series.clone(),
+            series_index: self.series_index,
+            tags: self.tags.clone(),
+            rating: self.rating,
+            publisher: self.publisher.clone(),
+            year: self.year,
+            language: self.language.clone(),
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -249,19 +289,31 @@ fn main() -> Result<()> {
     if let Some(command) = &cli.command {
         return match command {
             Command::List { json, filter } => list_library(*json, filter.as_deref().unwrap_or("")),
+            Command::Authors { json } => {
+                let config = paths::Config::load()?;
+                list_authors(&config.journal_dir()?, *json)
+            }
             Command::Scan { dir, filenames } => scan_directory(dir, *filenames),
             Command::Find { text } => find_and_open(text),
             Command::Show { book, json } => {
                 let config = paths::Config::load()?;
                 metadata(book, &config.journal_dir()?, &Fields::default(), *json)
             }
-            Command::Set { book, fields } => {
+            Command::Set { book, json, fields } => {
                 let config = paths::Config::load()?;
-                metadata(book, &config.journal_dir()?, &Fields::parse(fields)?, false)
+                metadata(book, &config.journal_dir()?, &Fields::parse(fields)?, *json)
             }
-            Command::Forget { what } => {
+            Command::Edit {
+                filter,
+                json,
+                fields,
+            } => {
                 let config = paths::Config::load()?;
-                forget(what, &config.journal_dir()?)
+                edit_matched(filter, &config.journal_dir()?, &Fields::parse(fields)?, *json)
+            }
+            Command::Forget { what, json } => {
+                let config = paths::Config::load()?;
+                forget(what, &config.journal_dir()?, *json)
             }
             Command::Export {
                 dir,
@@ -369,12 +421,12 @@ fn read_anything(reference: &str, chapter: Option<&str>, at: Option<&str>) -> Re
 /// What picks the books is a path when the path exists — that is how a person
 /// points at a shelf, and a folder means everything under it — and a book id or a
 /// title otherwise.
-fn forget(reference: &str, journal_dir: &Path) -> Result<()> {
+fn forget(reference: &str, journal_dir: &Path, json: bool) -> Result<()> {
     let state = Journal::replay(journal_dir)?;
 
     let as_path = PathBuf::from(shellexpand(reference));
     if as_path.exists() {
-        return forget_under(&as_path, &state, journal_dir);
+        return forget_under(&as_path, &state, journal_dir, json);
     }
 
     let id = library::resolve(&state, reference)?;
@@ -385,13 +437,20 @@ fn forget(reference: &str, journal_dir: &Path) -> Result<()> {
 
     let mut journal = Journal::open(journal_dir)?;
     journal.append(&id, Payload::BookForgotten)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!([{ "id": id.as_str(), "title": title }]))?
+        );
+        return Ok(());
+    }
     println!("forgot {title}");
     Ok(())
 }
 
 /// Forgets every book the library holds under a directory, or the one file that
 /// was named.
-fn forget_under(root: &Path, state: &State, journal_dir: &Path) -> Result<()> {
+fn forget_under(root: &Path, state: &State, journal_dir: &Path, json: bool) -> Result<()> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     // A directory with the home directory inside it is not a shelf: it is a typo,
@@ -420,6 +479,15 @@ fn forget_under(root: &Path, state: &State, journal_dir: &Path) -> Result<()> {
     let mut journal = Journal::open(journal_dir)?;
     for (id, _) in &chosen {
         journal.append(id, Payload::BookForgotten)?;
+    }
+
+    if json {
+        let items: Vec<serde_json::Value> = chosen
+            .iter()
+            .map(|(id, title)| serde_json::json!({ "id": id.as_str(), "title": title }))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&items)?);
+        return Ok(());
     }
 
     println!(
@@ -481,6 +549,88 @@ fn metadata(reference: &str, journal_dir: &Path, fields: &Fields, json: bool) ->
     known_book(&state, journal_dir, &id, fields, json)
 }
 
+/// Applies one correction to every book a word picks out.
+///
+/// One book at a time is how a person fixes a title; an agent normalising a
+/// name a dozen files spell a dozen ways wants one call. The matcher is the one
+/// `list --filter` uses, so a preview is always `list --filter WORD --json`
+/// away.
+fn edit_matched(needle: &str, journal_dir: &Path, fields: &Fields, json: bool) -> Result<()> {
+    let state = Journal::replay(journal_dir)?;
+    let entries = library::filter(&library::entries(&state), needle);
+    if entries.is_empty() {
+        bail!("{}", library::no_match(needle));
+    }
+
+    let changes = fields.changes();
+    let ids: std::collections::HashSet<BookId> =
+        entries.iter().map(|entry| entry.id.clone()).collect();
+    let mut journal = Journal::open(journal_dir)?;
+    for id in &ids {
+        journal.append(id, changes.clone())?;
+    }
+
+    if json {
+        // What the books read as now, so the caller sees what it wrote.
+        let after = Journal::replay(journal_dir)?;
+        let records: Vec<serde_json::Value> = library::entries(&after)
+            .iter()
+            .filter(|entry| ids.contains(&entry.id))
+            .map(|entry| book_json(entry, &after))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&records)?);
+        return Ok(());
+    }
+    println!(
+        "corrected {} matching {}:",
+        counted(ids.len(), "book"),
+        shown(needle)
+    );
+    for entry in &entries {
+        println!("  {}", journal::clean(&entry.record.display_title()));
+    }
+    Ok(())
+}
+
+/// Every distinct author name, with the number of books it names.
+///
+/// The same author is written several ways across books — "Murakami, Haruki"
+/// here, "Haruki Murakami" there, a Chinese form somewhere else — and nothing
+/// in the files ties them together. This is the view that shows the mess, so a
+/// correction can be aimed at all of one spelling with `edit`.
+fn list_authors(journal_dir: &Path, json: bool) -> Result<()> {
+    let state = Journal::replay(journal_dir)?;
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for entry in library::entries(&state) {
+        for author in &entry.record.authors {
+            let name = author.trim();
+            if !name.is_empty() {
+                *counts.entry(name.to_string()).or_default() += 1;
+            }
+        }
+    }
+
+    let mut rows: Vec<(String, usize)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+
+    if json {
+        let items: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(name, books)| serde_json::json!({ "author": name, "books": books }))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&items)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("no authors in the library");
+        return Ok(());
+    }
+    for (name, books) in &rows {
+        println!("{books:>4}  {}", journal::clean(name));
+    }
+    Ok(())
+}
+
 /// Shows what the library holds about one book, or records the correction
 /// asked for. Both live here because `show` is `known_book` with no fields to
 /// set: one path, so what is printed and what is written cannot drift apart.
@@ -491,17 +641,7 @@ fn known_book(
     fields: &Fields,
     json: bool,
 ) -> Result<()> {
-    let changes = Payload::MetadataSet {
-        title: fields.title.clone(),
-        authors: fields.authors.as_deref().map(split_list),
-        series: fields.series.clone(),
-        series_index: fields.series_index,
-        tags: fields.tags.as_deref().map(split_list),
-        rating: fields.rating,
-        publisher: fields.publisher.clone(),
-        year: fields.year,
-        language: fields.language.clone(),
-    };
+    let changes = fields.changes();
 
     if fields.is_empty() {
         let record = state
@@ -561,6 +701,18 @@ fn known_book(
 
     let mut journal = Journal::open(journal_dir)?;
     journal.append(id, changes)?;
+    if json {
+        // What the book reads as now, so the caller sees what it wrote.
+        let after = Journal::replay(journal_dir)?;
+        let record = after
+            .book(id)
+            .with_context(|| format!("the journal knows nothing about {id}"))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&record_json(id, record, &after))?
+        );
+        return Ok(());
+    }
     println!("corrected; the library shows this from now on:");
     println!("  omaread show {id}");
     Ok(())
@@ -615,6 +767,25 @@ fn split_list(text: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Reads a list value: a JSON array of strings, or a comma-separated list.
+///
+/// The JSON form is how a name holding a comma survives — `authors=["Le Guin,
+/// Ursula"]` is one author, where the comma form would read it as two. Anything
+/// else is the comma form, which is what a person types at a shell.
+fn parse_list(value: &str) -> Result<Vec<String>> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[') {
+        let items: Vec<String> = serde_json::from_str(trimmed)
+            .with_context(|| format!("{trimmed:?} is not a JSON list of names"))?;
+        return Ok(items
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect());
+    }
+    Ok(split_list(value))
 }
 
 /// Restores the usual reaction to a pipe nobody reads any more.
@@ -1821,6 +1992,20 @@ mod tests {
         assert_eq!(or_dash(String::new()), "-");
         assert_eq!(or_dash("   ".to_string()), "-");
         assert_eq!(or_dash("村上春树".to_string()), "村上春树");
+    }
+
+    #[test]
+    fn a_list_value_is_json_when_it_is_one_and_commas_otherwise() {
+        // The comma form is what a person types, and an empty value clears.
+        assert_eq!(parse_list("A, B ,C").unwrap(), ["A", "B", "C"]);
+        assert_eq!(parse_list("A，B").unwrap(), ["A", "B"], "the wide comma too");
+        assert_eq!(parse_list("").unwrap(), Vec::<String>::new());
+
+        // The JSON form is how a name that holds a comma survives: it is one
+        // author, where the comma form would read it as two.
+        assert_eq!(parse_list(r#"["Le Guin, Ursula"]"#).unwrap(), ["Le Guin, Ursula"]);
+        assert_eq!(parse_list(r#"[ "a" , "b" ]"#).unwrap(), ["a", "b"]);
+        assert!(parse_list("[not json").is_err());
     }
 
     #[test]

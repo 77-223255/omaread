@@ -262,7 +262,7 @@ impl Shelf {
             ("Enter l", t("open the book")),
             ("/", t("filter by title, author, series or tag")),
             ("Esc", t("clear the filter")),
-            ("s", t("cycle the order: title, author, series")),
+            ("s", t("cycle the order: title, author")),
             ("q", t("quit")),
         ]
     }

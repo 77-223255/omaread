@@ -72,10 +72,12 @@ author the library knows, or a file on disk.
 | `omaread` | read the library |
 | `omaread BOOK [--chapter N\|HREF] [--at TEXT]` | read one book, at a place |
 | `omaread list [--json] [--filter TEXT]` | the library as a table |
+| `omaread authors [--json]` | the distinct author names, and how many books each is on |
 | `omaread scan DIR [--filenames]` | add the books of a directory to the library, and notice moved ones |
 | `omaread show BOOK [--json]` | what a book says about itself |
-| `omaread set BOOK field=value …` | correct what a book says about itself, without touching the file |
-| `omaread forget BOOK` | take a book, or a whole shelf, out of the library |
+| `omaread set BOOK field=value … [--json]` | correct one book, without touching the file |
+| `omaread edit TEXT field=value … [--json]` | correct every book a word picks out, in one call |
+| `omaread forget BOOK [--json]` | take a book, or a whole shelf, out of the library |
 | `omaread find TEXT` | search the whole library and read the hit |
 | `omaread export [DIR] [--force] [--reindex] [--embed]` | write the library as Markdown, one file per chapter |
 | `omaread inspect BOOK` | what a book file holds, without the library |
@@ -85,9 +87,28 @@ author the library knows, or a file on disk.
 | `omaread --version` | the version |
 
 `set` fields: `title`, `authors`, `series`, `series-index`, `tags`, `rating`,
-`publisher`, `year`, `language`. An empty value clears the field. A correction
-is a journal event: it wins over the file, survives a rescan, and never writes
-into the EPUB.
+`publisher`, `year`, `language`. An empty value clears the field. `authors`
+and `tags` take a comma-separated list, or a JSON array when a name holds a
+comma of its own: `set BOOK 'authors=["Le Guin, Ursula"]'`. A correction is a
+journal event: it wins over the file, survives a rescan, and never writes into
+the EPUB.
+
+### For scripts and agents
+
+Each command is a verb on the library — `scan` adds, `set` and `edit` correct,
+`forget` removes, `list`/`show`/`authors` read — and every one a program would
+parse prints JSON with `--json`. A correction is always a journal event, so an
+agent needs no private file format, only the command line.
+
+The one to reach for when an agent has to tidy metadata is `edit`: it acts on
+the whole set a word picks out, in one call. An author that a dozen files spell
+a dozen ways is the case it exists for:
+
+```bash
+omaread authors                                   # the spellings, with counts
+omaread list --filter "Murakami" --json           # preview what a word picks out
+omaread edit "Haruki Murakami" 'authors=["村上春树"]' --json
+```
 
 `export` is for feeding a search engine; `--reindex` hands the result to
 [qmd](https://github.com/tobi/qmd) and `--embed` also updates embeddings.

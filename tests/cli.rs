@@ -557,3 +557,63 @@ fn an_export_writes_files_the_owner_only_can_read() {
         octal
     );
 }
+
+#[test]
+fn the_author_names_can_be_read_and_corrected_in_bulk() {
+    // The case an agent is handed: one author, written several ways across
+    // books. `authors` shows the mess, `edit` fixes a whole spelling in one
+    // call, and the JSON list form keeps a name that holds a comma whole.
+    let dir = scratch("authors");
+    book(&dir.join("books/one.epub"), "One", &["text"]);
+    book(&dir.join("books/two.epub"), "Two", &["text"]);
+    let out = omaread(&dir).args(["scan", "books"]).output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // Both files name their author the same way, and the view says so once.
+    let out = omaread(&dir).args(["authors", "--json"]).output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let authors: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(authors.as_array().map(Vec::len), Some(1), "{authors}");
+    assert_eq!(authors[0]["author"], "Stephenson");
+    assert_eq!(authors[0]["books"], 2);
+
+    // One call corrects every book the word picks out, and says what it wrote.
+    let out = omaread(&dir)
+        .args([
+            "edit",
+            "Stephenson",
+            r#"authors=["Neal Stephenson"]"#,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let changed: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(changed.as_array().map(Vec::len), Some(2), "{changed}");
+    assert!(
+        changed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|book| book["authors"] == serde_json::json!(["Neal Stephenson"])),
+        "{changed}"
+    );
+
+    // The view agrees, and the old spelling is gone.
+    let out = omaread(&dir).args(["authors", "--json"]).output().unwrap();
+    let authors: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(authors.as_array().map(Vec::len), Some(1), "{authors}");
+    assert_eq!(authors[0]["author"], "Neal Stephenson");
+    assert_eq!(authors[0]["books"], 2);
+
+    // A name holding a comma survives the JSON list form: it is one author,
+    // where `authors=Le Guin, Ursula` would have been read as two.
+    let id = id_of(&dir.join("books/one.epub"));
+    let out = omaread(&dir)
+        .args(["set", &id[..12], r#"authors=["Le Guin, Ursula"]"#, "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let book: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(book["authors"], serde_json::json!(["Le Guin, Ursula"]));
+}

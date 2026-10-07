@@ -70,10 +70,12 @@ omaread                # 打开书库
 | `omaread` | 读书库 |
 | `omaread BOOK [--chapter N\|HREF] [--at TEXT]` | 读一本书，并可定位 |
 | `omaread list [--json] [--filter TEXT]` | 以表格列出书库 |
+| `omaread authors [--json]` | 所有不同的作者名，以及各自出现在几本书上 |
 | `omaread scan DIR [--filenames]` | 收录某个目录下的书，并识别移动过的书 |
 | `omaread show BOOK [--json]` | 书自称的信息 |
-| `omaread set BOOK field=value …` | 更正书自称的信息，不改动文件 |
-| `omaread forget BOOK` | 移出一本书，或整个书架 |
+| `omaread set BOOK field=value … [--json]` | 更正一本书的信息，不改动文件 |
+| `omaread edit TEXT field=value … [--json]` | 一次更正某个词命中的每一本书 |
+| `omaread forget BOOK [--json]` | 移出一本书，或整个书架 |
 | `omaread find TEXT` | 全库搜索并阅读命中的位置 |
 | `omaread export [DIR] [--force] [--reindex] [--embed]` | 导出 Markdown，每章一个文件 |
 | `omaread inspect BOOK` | 书文件里有什么，不经过书库 |
@@ -83,8 +85,25 @@ omaread                # 打开书库
 | `omaread --version` | 版本 |
 
 `set` 支持的字段：`title`、`authors`、`series`、`series-index`、`tags`、
-`rating`、`publisher`、`year`、`language`。值为空表示清除该字段。更正会作为
-一条日志事件：优先于文件内容、重扫后仍在，且绝不写入 EPUB。
+`rating`、`publisher`、`year`、`language`。值为空表示清除该字段。`authors` 和
+`tags` 接受逗号分隔的列表；当名字自身带逗号时，用 JSON 数组：
+`set BOOK 'authors=["Le Guin, Ursula"]'`。更正会作为一条日志事件：优先于
+文件内容、重扫后仍在，且绝不写入 EPUB。
+
+### 给脚本和 agent
+
+每条命令都是对书库的一个动词——`scan` 增加、`set` 和 `edit` 更正、`forget`
+移除、`list`/`show`/`authors` 读取——凡是程序要解析的都有 `--json`。更正总是
+日志事件，所以 agent 不需要什么私有文件格式，只要命令行。
+
+要整理元数据，用 `edit`：它一次作用在某个词命中的整组书上。同一个作者被十几
+个文件写成十几种拼法，正是它存在的理由：
+
+```bash
+omaread authors                                   # 各种拼法，带计数
+omaread list --filter "Murakami" --json           # 预览一个词命中的书
+omaread edit "Haruki Murakami" 'authors=["村上春树"]' --json
+```
 
 `export` 用于喂给搜索引擎；`--reindex` 把结果交给
 [qmd](https://github.com/tobi/qmd)，`--embed` 还会更新 embedding。装了 qmd 时

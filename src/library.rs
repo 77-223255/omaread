@@ -47,8 +47,6 @@ const SHORT_PREFIX: usize = 12;
 pub enum Order {
     Title,
     Author,
-    /// Series first, then position within it; books without a series last.
-    Series,
 }
 
 impl Order {
@@ -56,15 +54,13 @@ impl Order {
         match self {
             Order::Title => "title",
             Order::Author => "author",
-            Order::Series => "series",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
             Order::Title => Order::Author,
-            Order::Author => Order::Series,
-            Order::Series => Order::Title,
+            Order::Author => Order::Title,
         }
     }
 }
@@ -233,24 +229,6 @@ pub fn sort(entries: &mut [Entry], order: Order) {
             match (key(a), key(b)) {
                 (Some(x), Some(y)) => x.cmp(&y).then_with(|| {
                     sortable(&a.record.display_title()).cmp(&sortable(&b.record.display_title()))
-                }),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => {
-                    sortable(&a.record.display_title()).cmp(&sortable(&b.record.display_title()))
-                }
-            }
-        }),
-        Order::Series => entries.sort_by(|a, b| {
-            // Books outside a series come last rather than clumping under an
-            // empty heading.
-            let key = |e: &Entry| e.record.series.as_ref().map(|s| sortable(s));
-            match (key(a), key(b)) {
-                (Some(x), Some(y)) => x.cmp(&y).then_with(|| {
-                    a.record
-                        .series_index
-                        .unwrap_or(f32::MAX)
-                        .total_cmp(&b.record.series_index.unwrap_or(f32::MAX))
                 }),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -614,29 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn sorting_puts_series_in_order_and_leaves_what_is_missing_last() {
-        // A series is read in the order the books come in, position and all.
-        let mut list = vec![
-            entry("Third", "A", Some("Saga"), Some(3.0)),
-            entry("Interlude", "A", Some("Saga"), Some(1.5)),
-            entry("First", "A", Some("Saga"), Some(1.0)),
-        ];
-        sort(&mut list, Order::Series);
-        let titles: Vec<_> = list
-            .iter()
-            .map(|e| e.record.title.clone().unwrap())
-            .collect();
-        assert_eq!(titles, ["First", "Interlude", "Third"]);
-
-        // And a book without the field being sorted on comes last, in the
-        // author order as much as in the series one.
-        let mut list = vec![
-            entry("Loose", "A", None, None),
-            entry("In a series", "A", Some("Saga"), Some(1.0)),
-        ];
-        sort(&mut list, Order::Series);
-        assert_eq!(list[0].record.series.as_deref(), Some("Saga"));
-
+    fn a_book_without_the_field_sorted_on_comes_last() {
         let mut nameless = entry("Zzz Anonymous", "", None, None);
         nameless.record.authors.clear();
         let mut list = vec![nameless, entry("Anathem", "Stephenson", None, None)];
