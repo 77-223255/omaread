@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  omaread — the mark.
+
+  An open book drawn in one weight of line, two colours, nothing filled and
+  nothing shaded. Flat by construction: there is no gradient, no tile and no
+  second weight to go flat. The outer corners lift and the foot dips to the
+  spine, which is what says "open" rather than "closed" at any size.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256"
+     fill="none" stroke="#000000" stroke-width="14"
+     stroke-linecap="round" stroke-linejoin="round">
+  <path d="M127 84 C105 64 73 56 45 64 L45 176 C73 168 105 176 127 194 Z"/>
+  <path d="M129 84 C151 64 183 56 211 64 L211 176 C183 168 151 176 129 194 Z"/>
+</svg>

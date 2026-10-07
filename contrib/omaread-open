@@ -1,0 +1,23 @@
+#!/bin/sh
+# Open a book in a terminal, the way a double click should.
+#
+# The reader is a full screen program, so something has to open a terminal for
+# it, and the desktop has to be told which terminal. `xdg-terminal-exec` is that
+# something: it reads the list of terminals registered on the machine and picks
+# the first, rather than this file guessing between Ghostty, kitty and foot.
+#
+# The window is held only when the reader failed. A book that cannot be opened
+# prints its reason to stderr, and a window that closes on the same breath takes
+# the reason with it.
+set -u
+
+if omaread "$@"; then
+    exit 0
+fi
+
+status=$?
+echo >&2
+echo "omaread exited with status $status." >&2
+printf 'Press Enter to close. ' >&2
+read -r _ || true
+exit "$status"

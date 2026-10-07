@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Omaread
+GenericName=Ebook Reader
+Comment=Read EPUB books in the terminal
+Exec=xdg-terminal-exec omaread-open %f
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/epub+zip;
+Keywords=ebook;epub;reader;book;terminal;text;
+Icon=omaread
+StartupNotify=false
