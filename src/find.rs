@@ -243,7 +243,7 @@ fn search_directly(
 ) -> Result<Vec<Hit>> {
     let mut entries = library::entries(state);
     // Title order, so a search reads the same way twice.
-    library::sort(&mut entries, library::Order::Title);
+    library::sort(&mut entries, library::Order::Title, &library::Keys::default());
 
     let mut hits = Vec::new();
     for entry in entries {

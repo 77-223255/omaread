@@ -1,6 +1,7 @@
 //! omaread - a terminal ebook reader with library management.
 
 mod app;
+mod decision;
 mod doc;
 mod epub;
 mod export;
@@ -14,6 +15,7 @@ mod library;
 mod paths;
 mod search;
 mod shelf;
+mod sorts;
 mod theme;
 mod ui;
 
@@ -706,11 +708,22 @@ fn browse() -> Result<()> {
     let mut terminal = ratatui::init();
     let cell = cell_size(&terminal);
     let mut theme = theme::Watcher::new();
+    // One client for the whole session, so its cache of answers survives the
+    // shelf being rebuilt every time a book is left.
+    let mut decision = decision::Decision::new(
+        decision::Config::resolve(
+            config.decision.base_url.clone(),
+            config.decision.model.clone(),
+            config.decision.api_key_env.clone(),
+        ),
+        decision::Curl,
+    );
 
     let result = (|| -> Result<()> {
         loop {
             let state = Journal::replay(&journal_dir)?;
             let mut shelf = shelf::Shelf::new(&state);
+            shelf.set_decision_ready(decision.available());
             if shelf.total() == 0 {
                 ratatui::restore();
                 empty_library_hint();
@@ -728,6 +741,13 @@ fn browse() -> Result<()> {
                             shelf::Action::Open { id, path } => break Some((id, path)),
                             shelf::Action::Quit => break None,
                             shelf::Action::None => {}
+                        }
+                        // An order that has to be asked of the model: show the
+                        // waiting line, then go and ask, so the screen is not
+                        // blank while the request is out.
+                        if shelf.asking() {
+                            terminal.draw(|frame| ui::draw_shelf(frame, &mut shelf, &colours))?;
+                            shelf.resolve(&mut decision);
                         }
                     }
                     _ => {}
@@ -1160,7 +1180,7 @@ fn list_library(as_json: bool, needle: &str) -> Result<()> {
     let config = paths::Config::load()?;
     let state = Journal::replay(&config.journal_dir()?)?;
     let mut entries = library::entries(&state);
-    library::sort(&mut entries, library::Order::Title);
+    library::sort(&mut entries, library::Order::Title, &library::Keys::default());
     let entries = library::filter(&entries, needle);
 
     if as_json {

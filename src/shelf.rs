@@ -4,10 +4,12 @@
 //! ordered, what is filtered. Separate from `library`, which holds the data and
 //! knows nothing about a screen.
 
+use crate::decision;
 use crate::i18n;
 use crate::identity::BookId;
 use crate::journal::State;
-use crate::library::{self, Entry, Order};
+use crate::library::{self, Entry, Keys, Order};
+use crate::sorts;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use std::path::PathBuf;
 
@@ -16,7 +18,18 @@ pub enum Mode {
     Browse,
     /// Typing a filter.
     Filter,
+    /// Typing what the decision model should sort by.
+    Super,
     Help,
+}
+
+/// An order that has to be asked of the decision model before it can be applied.
+#[derive(Debug, Clone)]
+enum SortRequest {
+    /// A key per author, so the family name sorts first.
+    Authors(Vec<String>),
+    /// A score per book for a criterion the reader typed.
+    Rank { criterion: String },
 }
 
 /// What the shelf asks the session to do next.
@@ -44,6 +57,18 @@ pub struct Shelf {
     status: Option<String>,
     /// Pending first key of a sequence, such as `g` in `gg`.
     pending: Option<char>,
+    /// What the decision model decided, by request. Filled by `resolve`.
+    keys: Keys,
+    /// The criterion the last super sort used, kept so the box opens with it.
+    super_criterion: String,
+    /// The box's text while it is being typed.
+    super_input: String,
+    /// An order waiting on the decision model. The caller sees it, draws the
+    /// waiting frame, and calls `resolve` before the next draw.
+    asking: Option<SortRequest>,
+    /// Whether a key is configured. False means the plain sorts are all there
+    /// is, and the shelf says so rather than waiting on a call that cannot go.
+    decision_ready: bool,
     /// Rows the list can show, set by the view before each draw.
     view_height: u16,
     scroll: usize,
@@ -55,7 +80,7 @@ impl Shelf {
         // Title first: it is what the eye looks for, and it is the one field
         // almost every book fills in.
         let order = Order::Title;
-        library::sort(&mut all, order);
+        library::sort(&mut all, order, &Keys::default());
         let shown = all.clone();
         Self {
             all,
@@ -67,9 +92,20 @@ impl Shelf {
             mode: Mode::Browse,
             status: None,
             pending: None,
+            keys: Keys::default(),
+            super_criterion: String::new(),
+            super_input: String::new(),
+            asking: None,
+            decision_ready: false,
             view_height: 1,
             scroll: 0,
         }
+    }
+
+    /// Tells the shelf whether a decision model can be reached. Without one the
+    /// author order is the plain one and the super box has nothing to ask.
+    pub fn set_decision_ready(&mut self, ready: bool) {
+        self.decision_ready = ready;
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -99,6 +135,21 @@ impl Shelf {
         } else {
             None
         }
+    }
+
+    /// The super-sort box's text, while it is open.
+    pub fn super_input(&self) -> Option<&str> {
+        if self.mode == Mode::Super {
+            Some(&self.super_input)
+        } else {
+            None
+        }
+    }
+
+    /// True while an order is waiting on the decision model. The caller draws
+    /// the waiting frame, then calls `resolve`.
+    pub fn asking(&self) -> bool {
+        self.asking.is_some()
     }
 
     pub fn status(&self) -> Option<&str> {
@@ -137,6 +188,10 @@ impl Shelf {
             Mode::Browse => self.handle_browse_key(key),
             Mode::Filter => {
                 self.handle_filter_key(key);
+                Action::None
+            }
+            Mode::Super => {
+                self.handle_super_key(key);
                 Action::None
             }
             Mode::Help => {
@@ -178,11 +233,13 @@ impl Shelf {
                     self.status = None;
                 }
             }
-            // Cycles through the orders rather than needing four keys.
-            KeyCode::Char('s') => {
-                self.order = self.order.next();
-                self.apply();
-                self.status = Some(i18n::fill("sorted by {}", &[&i18n::t(self.order.label())]));
+            // Cycles through the plain orders: title and author.
+            KeyCode::Char('s') => self.cycle_order(),
+            // The super order needs a criterion, so it opens a box to type one.
+            KeyCode::Char('S') => {
+                self.super_input = self.super_criterion.clone();
+                self.mode = Mode::Super;
+                self.status = None;
             }
             KeyCode::Enter | KeyCode::Char('l') => return self.open_selected(),
             _ => {}
@@ -217,11 +274,105 @@ impl Shelf {
         }
     }
 
+    fn handle_super_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Browse;
+                self.super_input.clear();
+            }
+            KeyCode::Enter => {
+                let criterion = self.super_input.trim().to_string();
+                self.mode = Mode::Browse;
+                if criterion.is_empty() {
+                    return;
+                }
+                self.super_criterion = criterion.clone();
+                self.order = Order::Super;
+                if !self.decision_ready {
+                    self.order = Order::Title;
+                    self.status = Some(i18n::t("no decision model is configured").into());
+                    return;
+                }
+                self.status = Some(i18n::t("asking the decision model ...").into());
+                self.asking = Some(SortRequest::Rank { criterion });
+            }
+            KeyCode::Backspace => {
+                self.super_input.pop();
+            }
+            KeyCode::Char(c) => self.super_input.push(c),
+            _ => {}
+        }
+    }
+
+    /// Steps to the next plain order: title, then author. Landing on the author
+    /// order asks the model for its keys the first time, since that is the one
+    /// thing the plain sort cannot do — put the family name first.
+    fn cycle_order(&mut self) {
+        self.order = self.order.next();
+        self.apply();
+        self.status = Some(i18n::fill("sorted by {}", &[&i18n::t(self.order.label())]));
+        if self.order != Order::Author || !self.keys.authors.is_empty() {
+            return;
+        }
+        if !self.decision_ready {
+            self.status = Some(i18n::t("no decision model: the plain author order").into());
+            return;
+        }
+        self.status = Some(i18n::t("asking the decision model ...").into());
+        self.asking = Some(SortRequest::Authors(self.authors()));
+    }
+
+    /// Asks the decision model for whatever order is waiting, then applies it.
+    /// Called by the caller after it has drawn the waiting frame. A model that
+    /// cannot answer leaves the plain order in place and says why.
+    ///
+    /// Generic over the transport so a test can hand in a fake and see the
+    /// whole ask-and-apply path without a network.
+    pub fn resolve<T: decision::Transport>(&mut self, decision: &mut decision::Decision<T>) {
+        let Some(request) = self.asking.take() else {
+            return;
+        };
+        let outcome = match request {
+            SortRequest::Authors(authors) => sorts::author_keys(decision, &authors).map(|keys| {
+                self.keys.authors.extend(keys);
+                i18n::fill("sorted by {}", &[&i18n::t("author")])
+            }),
+            SortRequest::Rank { criterion } => {
+                sorts::rank(decision, &criterion, &self.all).map(|scores| {
+                    self.keys.scores = scores;
+                    i18n::fill("sorted by {}", &[&criterion])
+                })
+            }
+        };
+        match outcome {
+            Ok(status) => self.status = Some(status),
+            Err(err) => {
+                self.order = Order::Title;
+                self.status = Some(i18n::fill(
+                    "the decision model could not answer: {}",
+                    &[&crate::journal::clean(&err.to_string())],
+                ));
+            }
+        }
+        self.apply();
+    }
+
+    /// The distinct, non-blank authors in the library, for the model to key.
+    fn authors(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.all
+            .iter()
+            .flat_map(|entry| entry.record.authors.iter())
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty() && seen.insert(name.clone()))
+            .collect()
+    }
+
     /// Re-sorts and re-filters, keeping the cursor on the same book where it
     /// still shows.
     fn apply(&mut self) {
         let selected = self.shown.get(self.cursor).map(|e| e.id.clone());
-        library::sort(&mut self.all, self.order);
+        library::sort(&mut self.all, self.order, &self.keys);
         self.shown = library::filter(&self.all, &self.filter);
         self.cursor = selected
             .and_then(|id| self.shown.iter().position(|e| e.id == id))
@@ -262,7 +413,8 @@ impl Shelf {
             ("Enter l", t("open the book")),
             ("/", t("filter by title, author, series or tag")),
             ("Esc", t("clear the filter")),
-            ("s", t("cycle the order: title, author, series")),
+            ("s", t("cycle the order: title, author")),
+            ("S", t("sort by anything: type a criterion for the model")),
             ("q", t("quit")),
         ]
     }
@@ -308,6 +460,11 @@ mod tests {
             mode: Mode::Browse,
             status: None,
             pending: None,
+            keys: Keys::default(),
+            super_criterion: String::new(),
+            super_input: String::new(),
+            asking: None,
+            decision_ready: false,
             view_height: 10,
             scroll: 0,
         };
@@ -399,5 +556,79 @@ mod tests {
             shelf.cursor(),
             shelf.scroll()
         );
+    }
+
+    /// A decision model that answers from a script and never leaves the process.
+    struct Answering(String);
+
+    impl decision::Transport for Answering {
+        fn post(
+            &self,
+            _url: &str,
+            _body: &str,
+            _headers: &[(&str, &str)],
+            _timeout: std::time::Duration,
+        ) -> anyhow::Result<String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn model(reply: &str) -> decision::Decision<Answering> {
+        decision::Decision::new(
+            decision::Config {
+                base_url: "https://example.test".into(),
+                model: "test/model".into(),
+                api_key: Some("secret".into()),
+                timeout: std::time::Duration::from_secs(5),
+            },
+            Answering(reply.to_string()),
+        )
+    }
+
+    #[test]
+    fn the_super_box_asks_the_model_and_sorts_by_its_scores() {
+        let mut shelf = shelf_of(&["Alpha", "Beta"]);
+        shelf.set_decision_ready(true);
+        shelf.handle_key(key(KeyCode::Char('S')));
+        assert_eq!(shelf.mode, Mode::Super, "the box is open");
+        for c in "cozy".chars() {
+            shelf.handle_key(key(KeyCode::Char(c)));
+        }
+        shelf.handle_key(key(KeyCode::Enter));
+        assert_eq!(shelf.mode, Mode::Browse, "the box closes on Enter");
+        assert!(shelf.asking(), "an order is waiting on the model");
+
+        let mut model = model(
+            r#"{"answers":{"b0":{"type":"score","score":9,"confidence":1},"b1":{"type":"score","score":1,"confidence":1}}}"#,
+        );
+        shelf.resolve(&mut model);
+        assert!(!shelf.asking());
+        assert_eq!(shelf.order(), Order::Super);
+        assert_eq!(shelf.entries()[0].record.title.as_deref(), Some("Alpha"));
+    }
+
+    #[test]
+    fn the_author_order_asks_the_model_and_falls_back_without_one() {
+        // No model configured: the plain author order, and nothing is asked.
+        let mut shelf = shelf_of(&["Alpha", "Beta"]);
+        shelf.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(shelf.order(), Order::Author);
+        assert!(!shelf.asking(), "no model, no call");
+        assert_eq!(
+            shelf.status(),
+            Some(crate::i18n::t("no decision model: the plain author order"))
+        );
+
+        // With a model, the key it returns decides the order.
+        let mut shelf = shelf_of(&["Alpha", "Beta"]);
+        shelf.set_decision_ready(true);
+        shelf.handle_key(key(KeyCode::Char('s')));
+        assert!(shelf.asking());
+        let mut model = model(
+            r#"{"answers":{"a0":{"type":"choice","choice":"family_last","confidence":1},"a1":{"type":"choice","choice":"single","confidence":1}}}"#,
+        );
+        shelf.resolve(&mut model);
+        assert!(!shelf.asking());
+        assert_eq!(shelf.order(), Order::Author);
     }
 }

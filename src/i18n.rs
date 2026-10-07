@@ -113,9 +113,26 @@ static ZH: &[(&str, &str)] = &[
     ("filter cleared", "已清除筛选"),
     ("clear the filter", "清除筛选"),
     ("open the book", "打开这本书"),
+    ("cycle the order: title, author", "切换排序：标题、作者"),
     (
-        "cycle the order: title, author, series",
-        "切换排序：标题、作者、系列",
+        "sort by anything: type a criterion for the model",
+        "任意排序：输入一句标准，交给模型",
+    ),
+    ("Super sort", "超级排序"),
+    (
+        "Sort the books by anything the model can judge:",
+        "输入一句标准，让模型给每本书打分：",
+    ),
+    ("Enter sorts  ·  Esc cancels", "Enter 排序  ·  Esc 取消"),
+    ("asking the decision model ...", "正在询问决策模型……"),
+    ("no decision model is configured", "尚未配置决策模型"),
+    (
+        "no decision model: the plain author order",
+        "没有决策模型：用普通的作者排序",
+    ),
+    (
+        "the decision model could not answer: {}",
+        "决策模型无法回答：{}",
     ),
     ("down, up", "下、上"),
     ("first, last", "首、尾"),
@@ -123,6 +140,7 @@ static ZH: &[(&str, &str)] = &[
     ("quit", "退出"),
     ("title", "标题"),
     ("author", "作者"),
+    ("super", "超级"),
     ("series", "系列"),
     ("{} hits for {}  ·  {}", "{} 条结果：{}  ·  {}"),
     ("{} hit for {}  ·  {}", "{} 条结果：{}  ·  {}"),
@@ -277,7 +295,7 @@ mod tests {
         for order in [
             crate::library::Order::Title,
             crate::library::Order::Author,
-            crate::library::Order::Series,
+            crate::library::Order::Super,
         ] {
             checked += 1;
             if translated(order.label()).is_none() {

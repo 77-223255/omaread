@@ -32,6 +32,22 @@ pub struct Config {
     /// How to draw pictures: `kitty`, `sixel` or `half-blocks`. `None` asks the
     /// terminal.
     pub images: Option<String>,
+    /// How the sorts reach a decision model. Left out, the plain sorts still
+    /// work and the model is simply not asked.
+    pub decision: DecisionSettings,
+}
+
+/// Settings for the decision model a sort can ask.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DecisionSettings {
+    /// The endpoint that serves the classifier. Defaults to OpenRouter.
+    pub base_url: Option<String>,
+    /// The classifier's model id. Defaults to the TypeSafe Jev classifier.
+    pub model: Option<String>,
+    /// The environment variable that holds the API key. `OPENROUTER_API_KEY`
+    /// and `OMAREAD_DECISION_API_KEY` are tried anyway.
+    pub api_key_env: Option<String>,
 }
 
 impl Config {
@@ -70,7 +86,15 @@ impl Config {
              # How pictures are drawn. Left out, the terminal is asked and the\n\
              # best of kitty, sixel and half-blocks is used. Inside tmux only\n\
              # half-blocks work, because tmux manages the screen itself.\n\
-             # images = \"sixel\"\n",
+             # images = \"sixel\"\n\
+             \n\
+             # The decision model a super sort asks. Left out, sorts fall back\n\
+             # to the plain order. The key comes from OMAREAD_DECISION_API_KEY\n\
+             # or the variable named below, and is never written here.\n\
+             # [decision]\n\
+             # base_url = \"https://openrouter.ai/api/v1\"\n\
+             # model = \"typesafe/jev-1.13\"\n\
+             # api_key_env = \"OPENROUTER_API_KEY\"\n",
             default_journal.display()
         );
         std::fs::write(&path, contents)

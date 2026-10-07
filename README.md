@@ -94,6 +94,35 @@ into the EPUB.
 `find` uses qmd's index when it is installed, and searches the books directly
 when it is not.
 
+## Sorting
+
+In the library, `s` cycles the two plain orders — title, then author — and `S`
+opens a box to sort by anything. Press `?` there for `j`, `k`, `/`, `s`, `S`
+and the rest.
+
+The author order and the super box ask a **decision model**: an LLM classifier
+that answers typed questions, not a chat model. The author order sends the
+author names and asks which part of each is the family name, so “Haruki
+Murakami” and “Murakami, Haruki” land together. The super box sends every book
+(title, authors, series, tags) and asks the model to score each one against
+whatever you typed — “cozy for a rainy night”, “shortest first”, “the ones I
+keep meaning to read” — then sorts by the score.
+
+The model lives in [`src/decision/`](src/decision): a layer with no idea what a
+book is, handed structured state and typed questions and handing back answers.
+It speaks TypeSafe’s “System One” protocol (`typesafe/jev-1.13`) through
+OpenRouter. This reader’s own two questions are in [`src/sorts.rs`](src/sorts.rs);
+the layer is written to be lifted into another program as it stands. A sort
+that means the same thing twice is answered from the session’s cache. With no
+key the reader still works: author falls back to the plain alphabetical order
+and the super box says so.
+
+Give it an OpenRouter key in `OPENROUTER_API_KEY` or
+`OMAREAD_DECISION_API_KEY`, or point at another endpoint in `[decision]` below.
+On a machine that already runs [pi](https://pi.dev), the OpenRouter key pi
+stores is used when no other is set — a convenience for trying it out, not a
+dependency.
+
 ## Settings and data
 
 Settings live in `~/.config/omaread/config.toml`, written with comments on
@@ -115,6 +144,14 @@ first start:
 # best of kitty, sixel and half-blocks is used. Inside tmux only
 # half-blocks work, because tmux manages the screen itself.
 # images = "sixel"
+
+# The decision model a super sort asks. Left out, sorts fall back
+# to the plain order. The key comes from OMAREAD_DECISION_API_KEY
+# or the variable named below, and is never written here.
+# [decision]
+# base_url = "https://openrouter.ai/api/v1"
+# model = "typesafe/jev-1.13"
+# api_key_env = "OPENROUTER_API_KEY"
 ```
 
 The journal is the source of truth: an append-only JSONL log, one line per

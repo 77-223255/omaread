@@ -8,7 +8,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, BorderType, Clear, List, ListItem, ListState, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Columns kept free left and right of the text.
@@ -727,6 +727,10 @@ pub fn draw_shelf(frame: &mut Frame, shelf: &mut crate::shelf::Shelf, theme: &cr
         draw_shelf_status(frame, status_area, shelf, theme);
     }
 
+    if shelf.mode == crate::shelf::Mode::Super {
+        draw_super(frame, list_area, shelf.super_input().unwrap_or(""), theme);
+    }
+
     if shelf.mode == crate::shelf::Mode::Help {
         draw_shelf_help(frame, list_area, theme);
     }
@@ -782,6 +786,66 @@ fn draw_shelf_status(
         ])),
         area,
     );
+}
+
+/// The super-sort box: a rounded panel in the middle of the shelf, asking for
+/// the criterion the decision model should rank the books by. The field scrolls
+/// from the left, so the caret stays in view however much is typed.
+fn draw_super(frame: &mut Frame, area: Rect, input: &str, theme: &crate::theme::Theme) {
+    let panel = centred(area, 64, 5);
+    frame.render_widget(Clear, panel);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(rgb(theme.accent)))
+        .title(Span::styled(
+            format!(" {} ", i18n::t("Super sort")),
+            Style::default()
+                .fg(rgb(theme.accent))
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(panel);
+    frame.render_widget(block, panel);
+
+    let shown = tail(input, (inner.width as usize).saturating_sub(2));
+    let lines = vec![
+        Line::from(Span::styled(
+            i18n::t("Sort the books by anything the model can judge:"),
+            Style::default().fg(rgb(theme.muted)),
+        )),
+        Line::from(vec![
+            Span::styled(
+                "> ",
+                Style::default()
+                    .fg(rgb(theme.accent))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(shown, Style::default().fg(rgb(theme.foreground))),
+            Span::styled("▏", Style::default().fg(rgb(theme.accent))),
+        ]),
+        Line::from(Span::styled(
+            i18n::t("Enter sorts  ·  Esc cancels"),
+            Style::default().fg(rgb(theme.muted)),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The last `width` cells of a line, so a long entry keeps its end — and the
+/// caret — in view.
+fn tail(text: &str, width: usize) -> String {
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 0;
+    for c in text.chars().rev() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        kept.push(c);
+    }
+    kept.reverse();
+    kept.into_iter().collect()
 }
 
 fn draw_shelf_help(frame: &mut Frame, area: Rect, theme: &crate::theme::Theme) {

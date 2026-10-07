@@ -47,8 +47,8 @@ const SHORT_PREFIX: usize = 12;
 pub enum Order {
     Title,
     Author,
-    /// Series first, then position within it; books without a series last.
-    Series,
+    /// An order the decision model chose from a criterion the reader typed.
+    Super,
 }
 
 impl Order {
@@ -56,17 +56,30 @@ impl Order {
         match self {
             Order::Title => "title",
             Order::Author => "author",
-            Order::Series => "series",
+            Order::Super => "super",
         }
     }
 
+    /// The orders `s` cycles through: the two that need no question asked.
+    /// The super order is reached through its own box, because it needs a
+    /// criterion that a keystroke cannot supply.
     pub fn next(self) -> Self {
         match self {
             Order::Title => Order::Author,
-            Order::Author => Order::Series,
-            Order::Series => Order::Title,
+            Order::Author | Order::Super => Order::Title,
         }
     }
+}
+
+/// What the decision model decided about the library: a sort key per author,
+/// and a score per book for a criterion the reader typed.
+///
+/// Empty by default, which is what every caller that never asks a model gets:
+/// the plain sorts keep working and the keys are ignored.
+#[derive(Debug, Clone, Default)]
+pub struct Keys {
+    pub authors: std::collections::HashMap<String, String>,
+    pub scores: std::collections::HashMap<BookId, i64>,
 }
 
 /// The title a file name suggests.
@@ -217,18 +230,19 @@ pub fn entries(state: &State) -> Vec<Entry> {
 }
 
 /// Sorts a list in place.
-pub fn sort(entries: &mut [Entry], order: Order) {
+pub fn sort(entries: &mut [Entry], order: Order, keys: &Keys) {
     match order {
         Order::Title => entries.sort_by_key(|e| sortable(&e.record.display_title())),
         Order::Author => entries.sort_by(|a, b| {
             // A book without an author belongs at the end, not in front of
             // everything: its placeholder would otherwise sort before the letters.
             let key = |e: &Entry| {
-                e.record
-                    .authors
-                    .first()
-                    .filter(|name| !name.trim().is_empty())
-                    .map(|name| sortable(name))
+                first_author(e).map(|name| {
+                    keys.authors
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| sortable(name))
+                })
             };
             match (key(a), key(b)) {
                 (Some(x), Some(y)) => x.cmp(&y).then_with(|| {
@@ -241,16 +255,12 @@ pub fn sort(entries: &mut [Entry], order: Order) {
                 }
             }
         }),
-        Order::Series => entries.sort_by(|a, b| {
-            // Books outside a series come last rather than clumping under an
-            // empty heading.
-            let key = |e: &Entry| e.record.series.as_ref().map(|s| sortable(s));
-            match (key(a), key(b)) {
-                (Some(x), Some(y)) => x.cmp(&y).then_with(|| {
-                    a.record
-                        .series_index
-                        .unwrap_or(f32::MAX)
-                        .total_cmp(&b.record.series_index.unwrap_or(f32::MAX))
+        // The model's score, highest first; books it did not score come last.
+        Order::Super => entries.sort_by(|a, b| {
+            let score = |e: &Entry| keys.scores.get(&e.id).copied();
+            match (score(a), score(b)) {
+                (Some(x), Some(y)) => y.cmp(&x).then_with(|| {
+                    sortable(&a.record.display_title()).cmp(&sortable(&b.record.display_title()))
                 }),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -260,6 +270,17 @@ pub fn sort(entries: &mut [Entry], order: Order) {
             }
         }),
     }
+}
+
+/// The first author of a book, with the blanks and the placeholder dropped.
+fn first_author(entry: &Entry) -> Option<&str> {
+    entry
+        .record
+        .authors
+        .first()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
 }
 
 /// Sort key: lowercase, and a leading article dropped so "The Hobbit" files
@@ -609,42 +630,52 @@ mod tests {
             entry("Zero to Sold", "Bechtel", None, None),
             entry("The Hobbit", "Tolkien", None, None),
         ];
-        sort(&mut list, Order::Title);
+        sort(&mut list, Order::Title, &Keys::default());
         assert_eq!(list[0].record.title.as_deref(), Some("The Hobbit"));
     }
 
     #[test]
-    fn sorting_puts_series_in_order_and_leaves_what_is_missing_last() {
-        // A series is read in the order the books come in, position and all.
-        let mut list = vec![
-            entry("Third", "A", Some("Saga"), Some(3.0)),
-            entry("Interlude", "A", Some("Saga"), Some(1.5)),
-            entry("First", "A", Some("Saga"), Some(1.0)),
-        ];
-        sort(&mut list, Order::Series);
-        let titles: Vec<_> = list
-            .iter()
-            .map(|e| e.record.title.clone().unwrap())
-            .collect();
-        assert_eq!(titles, ["First", "Interlude", "Third"]);
-
-        // And a book without the field being sorted on comes last, in the
-        // author order as much as in the series one.
-        let mut list = vec![
-            entry("Loose", "A", None, None),
-            entry("In a series", "A", Some("Saga"), Some(1.0)),
-        ];
-        sort(&mut list, Order::Series);
-        assert_eq!(list[0].record.series.as_deref(), Some("Saga"));
-
+    fn a_book_without_the_field_sorted_on_comes_last() {
         let mut nameless = entry("Zzz Anonymous", "", None, None);
         nameless.record.authors.clear();
         let mut list = vec![nameless, entry("Anathem", "Stephenson", None, None)];
-        sort(&mut list, Order::Author);
+        sort(&mut list, Order::Author, &Keys::default());
         assert_eq!(
             list[0].record.authors.first().map(String::as_str),
             Some("Stephenson")
         );
+    }
+
+    #[test]
+    fn the_decision_keys_are_what_the_author_and_super_orders_sort_on() {
+        let mut list = vec![
+            entry("Norwegian Wood", "Haruki Murakami", None, None),
+            entry("The Hobbit", "Tolkien", None, None),
+        ];
+        // Without a key, the plain author sort cannot join the two spellings.
+        // With one, a key the model supplied decides the order.
+        let mut keys = Keys::default();
+        keys.authors
+            .insert("Haruki Murakami".into(), "zzz murakami".into());
+        sort(&mut list, Order::Author, &keys);
+        assert_eq!(list[0].record.title.as_deref(), Some("The Hobbit"));
+
+        // The super order is by score, highest first, and a book the model did
+        // not score waits at the end.
+        let mut list = vec![
+            entry("Low", "A", None, None),
+            entry("High", "B", None, None),
+            entry("Unscored", "C", None, None),
+        ];
+        let mut keys = Keys::default();
+        keys.scores.insert(list[0].id.clone(), 1);
+        keys.scores.insert(list[1].id.clone(), 9);
+        sort(&mut list, Order::Super, &keys);
+        let titles: Vec<_> = list
+            .iter()
+            .map(|e| e.record.title.clone().unwrap())
+            .collect();
+        assert_eq!(titles, ["High", "Low", "Unscored"]);
     }
 
     #[test]

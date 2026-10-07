@@ -90,6 +90,29 @@ omaread                # 打开书库
 [qmd](https://github.com/tobi/qmd)，`--embed` 还会更新 embedding。装了 qmd 时
 `find` 用它的索引，没装则直接搜索书本。
 
+## 排序
+
+在书库里，`s` 在两种普通排序之间切换——标题、作者——而 `S` 会弹出一个输入框，
+可以按任意标准排序。在那里按 `?` 可以看到 `j`、`k`、`/`、`s`、`S` 等键。
+
+作者排序和超级排序会询问一个**决策模型**：一个回答「类型化问题」的 LLM 分类
+器，不是聊天模型。作者排序把作者名发给它，问每个名字里哪一段是姓，于是
+“Haruki Murakami” 和 “Murakami, Haruki” 会排在一起。超级排序把每本书（标题、
+作者、系列、标签）发给它，让它按你输入的那句话给每本书打分——比如“适合雨夜的
+温暖小书”、“最短的在前”、“一直想读的那些”——然后按分数排序。
+
+模型层在 [`src/decision/`](src/decision)：它完全不知道「书」是什么，只接收结构化
+的状态和类型化的问题、返回答案。它说的是 TypeSafe 的 “System One” 协议
+（`typesafe/jev-1.13`），经 OpenRouter 转发。本书自己的两个问题在
+[`src/sorts.rs`](src/sorts.rs)；这一层被写成一个可以原样搬到别的程序里的模块。
+同一个排序问第二次时直接用会话内缓存。没有 key 也能用：作者排序会退回普通的
+字母序，超级排序会告诉你没有配置模型。
+
+把 OpenRouter 的 key 放进 `OPENROUTER_API_KEY` 或 `OMAREAD_DECISION_API_KEY`，
+或在下面的 `[decision]` 里指向别的端点。如果机器上已经跑了
+[pi](https://pi.dev)，在没有其它 key 时会用 pi 存的那个 OpenRouter key——
+这只是方便试用，不是依赖。
+
 ## 设置与数据
 
 设置位于 `~/.config/omaread/config.toml`，首次启动时生成并带注释：
@@ -105,6 +128,13 @@ omaread                # 打开书库
 # 图片如何绘制。注释掉则询问终端，在 kitty、sixel、half-blocks 中
 # 选最好的。在 tmux 里只有 half-blocks 可用，因为 tmux 自己管理屏幕。
 # images = "sixel"
+
+# 超级排序询问的决策模型。注释掉则回退到普通排序。key 来自
+# OMAREAD_DECISION_API_KEY 或下面写的环境变量，绝不写进这个文件。
+# [decision]
+# base_url = "https://openrouter.ai/api/v1"
+# model = "typesafe/jev-1.13"
+# api_key_env = "OPENROUTER_API_KEY"
 ```
 
 日志是唯一事实来源：只追加的 JSONL，一行一个事件，位于
