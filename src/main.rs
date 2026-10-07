@@ -18,6 +18,9 @@ mod shelf;
 mod theme;
 mod ui;
 
+#[cfg(test)]
+mod testkit;
+
 use anyhow::{Context, Result, bail};
 use app::App;
 use cli::{Cli, Command, Fields, JournalCommand};
@@ -1680,11 +1683,12 @@ mod tests {
             names_a_file(&here.to_string_lossy()),
             "a file that is there is a file"
         );
+        std::fs::remove_file(&here).ok();
     }
 
     /// Writes an executable stub file, for a test that needs a path that exists.
     fn stub_file(name: &str, body: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("omaread-stub-{name}"));
+        let path = crate::testkit::path(&format!("stub-{name}"), "");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
@@ -1823,7 +1827,7 @@ mod tests {
         assert!(value["position"].is_null(), "nothing recorded yet");
 
         // Where the reader stopped belongs in as well, when there is one.
-        let journal_dir = std::env::temp_dir().join("omaread-test-book-json");
+        let journal_dir = crate::testkit::path("test-book-json", "");
         std::fs::remove_dir_all(&journal_dir).ok();
         let mut journal = Journal::open(&journal_dir).unwrap();
         journal

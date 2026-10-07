@@ -61,7 +61,7 @@ mod tests {
     use std::io::Write;
 
     fn temp_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("omaread-test-{name}"));
+        let path = crate::testkit::path(name, "");
         let mut file = File::create(&path).unwrap();
         file.write_all(contents).unwrap();
         path

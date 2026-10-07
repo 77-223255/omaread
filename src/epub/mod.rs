@@ -896,7 +896,7 @@ mod tests {
     /// driven the way a reader drives it — from a file on disk.
     fn container(name: &str, entries: &[(&str, &str)]) -> PathBuf {
         use std::io::Write;
-        let path = std::env::temp_dir().join(format!("omaread-epub-{name}.epub"));
+        let path = crate::testkit::path(name, ".epub");
         let file = File::create(&path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default();

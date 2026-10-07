@@ -783,10 +783,8 @@ mod tests {
         BookId::from(format!("sha256:{}", format!("{seed:02x}").repeat(32)))
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("omaread-journal-{name}"));
-        std::fs::remove_dir_all(&dir).ok();
-        dir
+    fn scratch(name: &str) -> crate::testkit::Scratch {
+        crate::testkit::Scratch::new(name)
     }
 
     fn locator(block: usize, offset: usize) -> Locator {
@@ -879,20 +877,7 @@ mod tests {
                         path: PathBuf::from("/books/a.epub"),
                     },
                 ),
-                (
-                    &book,
-                    Payload::MetadataSet {
-                        title: Some(String::new()),
-                        authors: None,
-                        series: None,
-                        series_index: None,
-                        tags: None,
-                        rating: None,
-                        publisher: None,
-                        year: None,
-                        language: None,
-                    },
-                ),
+                (&book, meta("")),
                 // Opened again: the same file, and no title of its own offered.
                 (
                     &book,
@@ -1140,7 +1125,7 @@ mod tests {
     /// Writes events straight to this machine's file with increasing timestamps
     /// and returns the directory. `append`'s wall clock is not ordered enough to
     /// say which event came first.
-    fn journal_of(name: &str, events: &[(&BookId, Payload)]) -> PathBuf {
+    fn journal_of(name: &str, events: &[(&BookId, Payload)]) -> crate::testkit::Scratch {
         let dir = scratch(name);
         Journal::open(&dir).unwrap();
         let own = dir.join("journal.jsonl");

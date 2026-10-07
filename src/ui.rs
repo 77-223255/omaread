@@ -983,8 +983,20 @@ mod tests {
     }
 
     /// Every row of a shelf drawn into a test terminal, one line to a string.
-    fn shelf_text(width: u16, height: u16) -> String {
-        let mut shelf = crate::shelf::Shelf::new(&State::default());
+    fn shelf_text_of(titles: &[&str], width: u16, height: u16) -> String {
+        let mut state = State::default();
+        for (index, title) in titles.iter().enumerate() {
+            state.apply(crate::journal::Event {
+                at: chrono::Utc::now(),
+                book: format!("sha256:{}", format!("{:02x}", index + 1).repeat(32)),
+                payload: crate::journal::Payload::BookSeen {
+                    title: Some((*title).to_string()),
+                    authors: Vec::new(),
+                    path: std::path::PathBuf::from(format!("/books/{index}.epub")),
+                },
+            });
+        }
+        let mut shelf = crate::shelf::Shelf::new(&state);
         let theme = crate::theme::Theme::default();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
@@ -1001,6 +1013,11 @@ mod tests {
             .join("\n")
     }
 
+    /// The same, for the empty shelf, where the count is all there is to see.
+    fn shelf_text(width: u16, height: u16) -> String {
+        shelf_text_of(&[], width, height)
+    }
+
     #[test]
     fn only_a_single_cell_gets_the_face() {
         let text = shelf_text(2, 1);
@@ -1012,13 +1029,15 @@ mod tests {
     #[test]
     fn a_small_frame_gives_its_only_rows_to_the_page() {
         // The status row is the first thing to go, so a shelf too short for
-        // both the count and the books still shows the books.
-        let tall = shelf_text(60, 6);
-        assert!(tall.contains('0'), "the count is there: {tall:?}");
-        let short = shelf_text(60, 3);
+        // both the count and the books still shows the books — which is only
+        // proven with a book on the shelf.
+        let tall = shelf_text_of(&["A Book"], 60, 6);
+        assert!(tall.contains('1'), "the count is there: {tall:?}");
+        let short = shelf_text_of(&["A Book"], 60, 3);
+        assert!(short.contains("A Book"), "the book is shown: {short:?}");
         assert!(
-            !short.contains('0'),
-            "the row is given to the page: {short:?}"
+            !short.contains('1'),
+            "the count gave its row to the page: {short:?}"
         );
     }
 
@@ -1115,14 +1134,14 @@ mod tests {
         // agree on that column — the block fallback pads each row out to it,
         // and a pixel escape is emitted there — or one backend would draw
         // the same book differently from another.
-        let book = std::env::temp_dir().join("omaread-ui-centre.epub");
+        let book = crate::testkit::path("ui-centre", ".epub");
         picture_book(&book, "Centre");
         for backend in [
             crate::image::Backend::HalfBlocks,
             crate::image::Backend::Kitty,
             crate::image::Backend::Sixel,
         ] {
-            let dir = std::env::temp_dir().join(format!("omaread-ui-centre-journal-{backend:?}"));
+            let dir = crate::testkit::path(&format!("ui-centre-journal-{backend:?}"), "");
             std::fs::remove_dir_all(&dir).ok();
             let mut app = App::new(
                 Book::open(&book).unwrap(),
@@ -1193,9 +1212,9 @@ mod tests {
     fn a_picture_shrinks_into_a_small_frame() {
         // Images do not only grow into the room: one too big for a small window
         // shrinks to fit it, so the picture stays instead of vanishing.
-        let book = std::env::temp_dir().join("omaread-ui-shrink.epub");
+        let book = crate::testkit::path("ui-shrink", ".epub");
         picture_book(&book, "Shrink");
-        let dir = std::env::temp_dir().join("omaread-ui-shrink-journal");
+        let dir = crate::testkit::path("ui-shrink-journal", "");
         std::fs::remove_dir_all(&dir).ok();
         let mut app = App::new(
             Book::open(&book).unwrap(),
@@ -1238,9 +1257,9 @@ mod tests {
         // The bug this guards: a title longer than the row used to run on and
         // push the progress off the right edge, so a small window showed where
         // you were in the book as nothing at all.
-        let book = std::env::temp_dir().join("omaread-ui-progress.epub");
+        let book = crate::testkit::path("ui-progress", ".epub");
         picture_book(&book, "The Long And Winding Book Title");
-        let dir = std::env::temp_dir().join("omaread-ui-progress-journal");
+        let dir = crate::testkit::path("ui-progress-journal", "");
         std::fs::remove_dir_all(&dir).ok();
         let mut app = App::new(
             Book::open(&book).unwrap(),

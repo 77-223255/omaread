@@ -323,10 +323,8 @@ mod tests {
     use super::*;
 
     /// A throwaway home directory, named after the test that uses it.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("omaread-theme-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    fn scratch(name: &str) -> crate::testkit::Scratch {
+        crate::testkit::Scratch::new(name)
     }
 
     #[test]

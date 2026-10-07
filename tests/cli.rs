@@ -33,12 +33,43 @@ fn omaread(scratch: &Path) -> Command {
     command
 }
 
+/// A scratch directory for one test: unique to this run, so two `cargo test`
+/// runs cannot delete each other's fixtures, and removed when the test ends,
+/// however it ends.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("omaread-cli-{}-{name}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A scratch directory, emptied first so each test starts from no library.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("omaread-cli-{name}"));
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn scratch(name: &str) -> Scratch {
+    Scratch::new(name)
 }
 
 fn stdout(out: &Output) -> String {
@@ -47,6 +78,15 @@ fn stdout(out: &Output) -> String {
 
 fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// The value shown on the line that starts with `label`, whatever the padding
+/// between the two. The field/value pair is what a test is about; the column it
+/// sits in is not.
+fn field(text: &str, label: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.trim_start().strip_prefix(label))
+        .map(|value| value.trim().to_string())
 }
 
 /// A minimal EPUB with one chapter per entry, which is all any of these
@@ -105,7 +145,7 @@ fn book(path: &Path, title: &str, chapters: &[&str]) {
 }
 
 /// A scratch library with one two-chapter book in it.
-fn scanned(name: &str) -> PathBuf {
+fn scanned(name: &str) -> Scratch {
     let dir = scratch(name);
     let file = dir.join("books/anathem.epub");
     book(
@@ -336,10 +376,10 @@ fn inspect_reports_what_it_found_for_pictures() {
     let out = omaread(&dir).arg("inspect").arg(&file).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
-    assert!(text.contains("layout:     pre-paginated"), "{text}");
+    assert_eq!(field(&text, "layout:").as_deref(), Some("pre-paginated"));
     // The cover's path is resolved against the package document, like any
     // other href in it.
-    assert!(text.contains("cover:      OEBPS/cover.png"), "{text}");
+    assert_eq!(field(&text, "cover:").as_deref(), Some("OEBPS/cover.png"));
 
     // A book that declared nothing reads `-`, like any other absent value:
     // reflowable is the default, and printing it as a declaration would
@@ -349,9 +389,9 @@ fn inspect_reports_what_it_found_for_pictures() {
     let out = omaread(&dir).arg("inspect").arg(&plain).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
-    assert!(text.contains("layout:     -"), "{text}");
+    assert_eq!(field(&text, "layout:").as_deref(), Some("-"));
     assert!(!text.contains("reflowable"), "{text}");
-    assert!(text.contains("cover:      -"), "{text}");
+    assert_eq!(field(&text, "cover:").as_deref(), Some("-"));
 }
 
 /// A book with two pictures in its first chapter: a 1×1 pixel named the
@@ -427,7 +467,7 @@ fn images_reports_each_picture_and_its_own_size() {
     let out = omaread(&dir).args(["images", &file]).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
-    assert!(text.contains(" px  "), "{text}");
+    assert!(text.contains(" px"), "{text}");
     assert!(text.contains("readable"), "{text}");
     assert!(!text.contains("cells"), "no drawn size in a report about a file: {text}");
     assert!(!text.contains("fill("), "no rule column either: {text}");
@@ -524,7 +564,7 @@ fn embed_waits_for_reindex() {
     let out = omaread(&dir).args(["export", "--embed"]).output().unwrap();
     assert!(!out.status.success(), "--embed alone must be refused");
     assert!(
-        !dir.join("data/export").exists(),
+        !dir.join("data/omaread/export").exists(),
         "an export that was refused still wrote something"
     );
 }

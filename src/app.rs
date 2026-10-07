@@ -1479,7 +1479,7 @@ mod tests {
             .expect("a PNG has an IDAT chunk");
         let liar = &png[..idat + 8];
 
-        let path = std::env::temp_dir().join("omaread-app-liar.epub");
+        let path = crate::testkit::path("app-liar", ".epub");
         let file = std::fs::File::create(&path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default();
@@ -1540,7 +1540,7 @@ mod tests {
         }
 
         let (path, book) = liar_book();
-        let dir = std::env::temp_dir().join("omaread-app-liar-journal");
+        let dir = crate::testkit::path("app-liar-journal", "");
         std::fs::remove_dir_all(&dir).ok();
         let journal = Journal::open(&dir).unwrap();
         let state = State::default();
