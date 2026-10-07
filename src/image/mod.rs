@@ -313,15 +313,15 @@ pub fn measure(
             }
         }
     };
-    let (max_cols, max_rows) = (box_cols as f32, box_rows as f32);
+    let (box_w, box_h) = (box_cols as f32, box_rows as f32);
     let (cols, rows) = match backend {
         Backend::HalfBlocks => {
             // One column is one pixel wide, one row is two tall, and a cell is
             // as tall as the terminal says: with a wide, short cell the picture
             // needs more rows for the same width, or it comes out stretched.
-            let cols = max_cols;
+            let cols = box_w;
             let rows_from_width = (height as f32 / width as f32) * cols / aspect;
-            let rows = rows_from_width.round().max(1.0).min(max_rows);
+            let rows = rows_from_width.round().max(1.0).min(box_h);
             // Recompute the width so a capped height does not stretch the picture.
             let cols = (rows * aspect * width as f32 / height as f32)
                 .round()
@@ -330,12 +330,12 @@ pub fn measure(
             (cols, rows)
         }
         Backend::Kitty | Backend::Sixel => {
-            let by_width = max_cols;
+            let by_width = box_w;
             let rows_needed = (height as f32 * (by_width * cell_w) / width as f32) / cell_h;
-            if rows_needed <= max_rows {
+            if rows_needed <= box_h {
                 (by_width, rows_needed.round().max(1.0))
             } else {
-                let rows = max_rows;
+                let rows = box_h;
                 let cols = (width as f32 * (rows * cell_h) / height as f32) / cell_w;
                 (cols.round().max(1.0).min(by_width), rows)
             }
@@ -412,6 +412,10 @@ fn encode_as_png(decoded: &DynamicImage) -> Vec<u8> {
 }
 
 /// Prepares a picture for a pixel protocol, sized to a whole number of cells.
+///
+/// The arguments are the picture, the room it was measured for, and the
+/// protocol that will draw it; bundling them would hide more than it saves.
+#[allow(clippy::too_many_arguments)]
 fn fit_pixels(
     decoded: &DynamicImage,
     original: &[u8],
@@ -464,7 +468,9 @@ fn fit_pixels(
                 .to_rgba8();
             sixel::encode(&scaled)
         }
-        Backend::HalfBlocks => String::new(),
+        // `render` sends half blocks to `fit`, which draws cells; only the two
+        // pixel protocols ever reach here.
+        Backend::HalfBlocks => unreachable!("half blocks are drawn by `fit`"),
     };
 
     Rendered {

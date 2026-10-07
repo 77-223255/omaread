@@ -58,12 +58,14 @@ mod tests {
         assert!(escape.contains("m=0"));
         assert!(escape.ends_with("\x1b\\"));
 
-        // Three chunks' worth of base64: only the first carries the
-        // parameters, the continuations announce more data, the last does not.
+        // Four chunks' worth of base64 — three bytes of input become four
+        // characters, so `CHUNK * 3` bytes is `CHUNK * 4` characters. Only the
+        // first chunk carries the parameters, the continuations announce more
+        // data, and the last one does not.
         let big = vec![0u8; CHUNK * 3];
         let escape = encode_png(&big, 40, 20, 1);
         let parts = escape.matches("\x1b_G").count();
-        assert!(parts >= 3, "{parts} chunks");
+        assert_eq!(parts, 4, "{parts} chunks");
         assert_eq!(escape.matches("f=100").count(), 1);
         assert!(escape.contains("m=1"));
         assert_eq!(escape.matches("m=0").count(), 1);

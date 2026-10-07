@@ -425,17 +425,16 @@ impl Journal {
                 if line.trim().is_empty() {
                     continue;
                 }
-                if let Ok(event) = serde_json::from_str::<Event>(&line) {
-                    if event.is_plausible() {
+                if let Ok(event) = serde_json::from_str::<Event>(&line)
+                    && event.is_plausible() {
                         events.push(event);
                     }
-                }
             }
         }
 
         // Apply in time order so the newest position wins regardless of which
         // file it came from.
-        events.sort_by(|a, b| a.at.cmp(&b.at));
+        events.sort_by_key(|a| a.at);
         let mut state = State::default();
         for event in events {
             state.apply(event);

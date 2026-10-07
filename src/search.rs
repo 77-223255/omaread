@@ -44,7 +44,8 @@ impl Search {
         self.current() == Some((block, offset))
     }
 
-    pub fn len(&self) -> usize {
+    /// Number of characters in the query, which is how long a match is.
+    pub fn query_len(&self) -> usize {
         self.query.chars().count()
     }
 
@@ -68,18 +69,6 @@ impl Search {
     /// found in this chapter.
     pub fn go_to_first_after(&mut self, block: usize, offset: usize) -> bool {
         match self.hits.iter().position(|hit| *hit >= (block, offset)) {
-            Some(index) => {
-                self.current = Some(index);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Selects the last match before a position.
-    #[cfg(test)]
-    pub fn go_to_last_before(&mut self, block: usize, offset: usize) -> bool {
-        match self.hits.iter().rposition(|hit| *hit < (block, offset)) {
             Some(index) => {
                 self.current = Some(index);
                 true
@@ -126,11 +115,6 @@ impl Search {
             }
             _ => false,
         }
-    }
-
-    /// Position of the match the reader is on, for scrolling to it.
-    pub fn current_position(&self) -> Option<Hit> {
-        self.current()
     }
 
     /// Which match of how many, for the status line.
@@ -250,10 +234,6 @@ mod tests {
         assert_eq!(search.current(), Some((2, 0)));
         // Nothing after the last match, so the caller looks further on.
         assert!(!search.go_to_first_after(3, 0));
-
-        assert!(search.go_to_last_before(2, 0));
-        assert_eq!(search.current(), Some((0, 0)));
-        assert!(!search.go_to_last_before(0, 0));
     }
 
     #[test]

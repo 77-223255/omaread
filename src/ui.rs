@@ -5,7 +5,7 @@ use crate::i18n;
 use crate::layout::{Line as SourceLine, LineKind};
 use crate::theme::text_color_on;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
@@ -13,6 +13,69 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Columns kept free left and right of the text.
 const SIDE_MARGIN: u16 = 2;
+
+/// The narrowest frame that keeps its margins. Below this the two cells of air
+/// on each side go back to the page: on a small screen a cell of text, or a
+/// cell of a cover, is worth more than a cell of margin.
+const MIN_WIDTH_FOR_SIDE_MARGIN: u16 = 20;
+
+/// The smallest frame that still shows a status row. Below either number the
+/// row is dropped and the page takes the whole frame — a line about how many
+/// books there are, or where you are in one, is worth less than the line of the
+/// book or the row of a cover it would cost.
+const STATUS_MIN_WIDTH: u16 = 30;
+const STATUS_MIN_HEIGHT: u16 = 4;
+
+/// The colours of the face left when nothing else fits: a hot pink for the eye
+/// and a cool cyan for the mouth, so even a screen with one cell on it has
+/// something worth looking at.
+const FACE_EYE: Color = Color::Rgb(255, 92, 168);
+const FACE_MOUTH: Color = Color::Rgb(96, 214, 255);
+
+/// The margin kept on a frame this wide.
+fn margin(width: u16) -> u16 {
+    if width >= MIN_WIDTH_FOR_SIDE_MARGIN {
+        SIDE_MARGIN
+    } else {
+        0
+    }
+}
+
+/// Whether the frame has room for both a page and the one status row.
+fn status_shown(area: Rect) -> bool {
+    area.width >= STATUS_MIN_WIDTH && area.height >= STATUS_MIN_HEIGHT
+}
+
+/// True when the terminal has shrunk to a single cell along either side: a
+/// screen one cell thick has nothing left to show, and a face is all there is.
+fn too_small(area: Rect) -> bool {
+    area.width <= 1 || area.height <= 1
+}
+
+/// Draws the face omaread makes when the terminal is down to a single cell: one
+/// line, in the middle, in the colour it keeps for last.
+fn draw_too_small(frame: &mut Frame, area: Rect) {
+    frame.render_widget(Clear, area);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let row = Rect {
+        y: area.y + area.height / 2,
+        height: 1,
+        ..area
+    };
+    let face = Line::from(vec![
+        Span::styled(
+            ":",
+            Style::default().fg(FACE_EYE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "(",
+            Style::default().fg(FACE_MOUTH).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(face).alignment(Alignment::Center), row);
+}
 
 fn rgb((r, g, b): crate::theme::Rgb) -> Color {
     Color::Rgb(r, g, b)
@@ -33,9 +96,15 @@ pub struct Placement {
 /// The split is built from `app::text_rows` — the reader's own count of the
 /// rows a picture may have — so the two cannot drift apart: one definition,
 /// and a picture whose room is taller than the area it is drawn in cannot
-/// run under the status line.
+/// run under the status line. On a small frame the row is dropped and the
+/// text area is the whole frame; the reader is told the same height, so the
+/// room for pictures and the rows they are drawn in are still one number.
 pub fn split_frame(area: Rect) -> (Rect, Rect) {
-    let text_height = crate::app::text_rows(area.height);
+    let text_height = if status_shown(area) {
+        crate::app::text_rows(area.height)
+    } else {
+        area.height
+    };
     let text = Rect {
         height: text_height,
         ..area
@@ -49,21 +118,29 @@ pub fn split_frame(area: Rect) -> (Rect, Rect) {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) -> Vec<Placement> {
+    if too_small(frame.area()) {
+        draw_too_small(frame, frame.area());
+        return Vec::new();
+    }
+
     let (text_area, status_area) = split_frame(frame.area());
 
+    let edge = margin(text_area.width);
     let inner = Rect {
-        x: text_area.x + SIDE_MARGIN,
+        x: text_area.x + edge,
         y: text_area.y,
-        width: text_area.width.saturating_sub(SIDE_MARGIN * 2),
+        width: text_area.width.saturating_sub(edge * 2),
         height: text_area.height,
     };
 
-    // The whole frame, not the text area: the reader takes the status row off
-    // itself, so the room for pictures and the rows the layout reserves for
-    // them are worked out in one place, from one height.
-    app.prepare(inner.width, frame.area().height);
+    // The text area, not the frame: the reader takes the status row off itself
+    // only while there is one, so the room for pictures and the rows the layout
+    // reserves for them are worked out in one place, from one height.
+    app.prepare(inner.width, text_area.height);
     draw_text(frame, inner, app);
-    draw_status(frame, status_area, app);
+    if status_area.height > 0 {
+        draw_status(frame, status_area, app);
+    }
 
     match app.mode {
         Mode::Contents => {
@@ -287,7 +364,7 @@ fn cell_style_at(
     search: &crate::search::Search,
 ) -> CellStyle {
     // A match spans the length of the query from its start.
-    let length = search.len();
+    let length = search.query_len();
     let hit = search.hits().iter().rev().find(|(hit_block, start)| {
         *hit_block == block && offset >= *start && offset < start + length
     });
@@ -390,11 +467,33 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         None => format!("{}  ·  {}", app.title(), app.chapter_title()),
     };
 
+    // The progress is what the row is for, so it is measured first and kept
+    // whole: the position, the total and the percentage, which is what tells
+    // the reader where they are. Everything else gives way to it.
+    let progress = format!("{current}/{total}  {:>3}%", app.progress());
+    let progress_width = cells(&progress);
+
+    // The mode is a courtesy, kept while there is still room for a title with
+    // more than the two characters and their mark that the floor leaves.
     let mode = match app.mode {
-        Mode::Normal => "NORMAL  ",
+        Mode::Cursor => "NORMAL  ",
         _ => "",
     };
-    let right = format!("{mode}{current}/{total}  {:>3}%", app.progress());
+    // Two characters of title and the ellipsis that says more is there.
+    const LEAST_TITLE: usize = 5;
+    let before_title =
+        (area.width as usize).saturating_sub(SIDE_MARGIN as usize * 2 + progress_width + 1);
+    let mode = if before_title >= cells(mode) + LEAST_TITLE {
+        mode
+    } else {
+        ""
+    };
+    let right = format!("{mode}{progress}");
+
+    // The title takes what is left, cut with a mark when it does not fit, so it
+    // can never push the progress off the row.
+    let room = (area.width as usize).saturating_sub(SIDE_MARGIN as usize * 2 + cells(&right) + 1);
+    let left = fit(&left, room);
 
     let gap = area
         .width
@@ -402,7 +501,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         .max(1);
 
     let mode_style = match app.mode {
-        Mode::Normal => Style::default().fg(rgb(theme.marks[1])),
+        Mode::Cursor => Style::default().fg(rgb(theme.marks[1])),
         _ => Style::default().fg(rgb(theme.muted)),
     };
 
@@ -499,6 +598,9 @@ pub fn cells(text: &str) -> usize {
 
 /// The text cut to fit a number of cells, with a mark where it was cut.
 fn cut(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     let mut out = String::new();
     let mut used = 0;
     for c in text.chars() {
@@ -513,27 +615,63 @@ fn cut(text: &str, width: usize) -> String {
     out
 }
 
+/// The text cut to fit a number of cells, with a mark where it was cut. Text
+/// that already fits is handed back untouched.
+fn fit(text: &str, width: usize) -> String {
+    if cells(text) <= width {
+        text.to_string()
+    } else {
+        cut(text, width)
+    }
+}
+
 // ----- the library view -----
+
+/// Below this width the shelf drops its author column: a title and a name
+/// beside it need room for both, and the title is what is being looked for.
+const AUTHOR_COLUMN_MIN: usize = 44;
+
+/// Below this width the shelf's status line keeps only the count of books.
+/// "by title · ? for keys" is the least of what it says; the count is the most.
+const SHELF_HINTS_MIN: usize = 34;
 
 /// Draws the shelf: one row per book, with a filter prompt when one is being
 /// typed.
 pub fn draw_shelf(frame: &mut Frame, shelf: &mut crate::shelf::Shelf, theme: &crate::theme::Theme) {
+    if too_small(frame.area()) {
+        draw_too_small(frame, frame.area());
+        return;
+    }
+
     let (list_area, status_area) = split_frame(frame.area());
 
+    let edge = margin(list_area.width);
     let inner = Rect {
-        x: list_area.x + SIDE_MARGIN,
+        x: list_area.x + edge,
         y: list_area.y,
-        width: list_area.width.saturating_sub(SIDE_MARGIN * 2),
+        width: list_area.width.saturating_sub(edge * 2),
         height: list_area.height,
     };
     shelf.prepare(inner.height);
 
     let width = inner.width as usize;
-    // Author and series get fixed shares; the title takes what is left, because
-    // it is what the eye looks for first.
-    let author_width = (width / 4).clamp(12, 30);
-    let series_width = (width / 5).clamp(0, 24);
-    let title_width = width.saturating_sub(author_width + series_width + 6);
+    // The title keeps its room first, because it is what the eye looks for. The
+    // author and series get fixed shares of what is left, and on a narrow shelf
+    // they step aside together: every row showing a name and half a title says
+    // less than a title that can name the book.
+    let show_author = width >= AUTHOR_COLUMN_MIN;
+    let (title_width, author_width, series_width) = if show_author {
+        let author_width = (width / 4).clamp(12, 30);
+        let series_width = (width / 5).clamp(0, 24);
+        // Two cells of air before the author, two more before the series.
+        (
+            width.saturating_sub(author_width + series_width + 4),
+            author_width,
+            series_width,
+        )
+    } else {
+        (width, 0, 0)
+    };
 
     let scroll = shelf.scroll();
     let rows: Vec<Line> = shelf
@@ -546,9 +684,6 @@ pub fn draw_shelf(frame: &mut Frame, shelf: &mut crate::shelf::Shelf, theme: &cr
             let selected = index == shelf.cursor();
             let record = &entry.record;
 
-            // A book that has been opened before carries a mark, so picking up
-            // where you left off does not need remembering.
-            let started = if entry.started { "▌" } else { " " };
             // The series a book belongs to, and where in it, which is what the
             // other orders leave room to show.
             let third = match (&record.series, record.series_index) {
@@ -568,13 +703,17 @@ pub fn draw_shelf(frame: &mut Frame, shelf: &mut crate::shelf::Shelf, theme: &cr
                 base.fg(rgb(theme.muted))
             };
 
-            let mut spans = vec![
-                Span::styled(started.to_string(), base.fg(rgb(theme.accent))),
-                Span::styled(" ", base),
-                Span::styled(pad(&record.display_title(), title_width), base),
-                Span::styled("  ", base),
-                Span::styled(pad(&record.display_authors(), author_width), dim),
-            ];
+            let mut spans = vec![Span::styled(
+                pad(&record.display_title(), title_width),
+                base,
+            )];
+            if author_width > 0 {
+                spans.push(Span::styled("  ", base));
+                spans.push(Span::styled(
+                    pad(&record.display_authors(), author_width),
+                    dim,
+                ));
+            }
             if series_width > 0 {
                 spans.push(Span::styled("  ", base));
                 spans.push(Span::styled(pad(&third, series_width), dim));
@@ -584,7 +723,9 @@ pub fn draw_shelf(frame: &mut Frame, shelf: &mut crate::shelf::Shelf, theme: &cr
         .collect();
 
     frame.render_widget(Paragraph::new(rows), inner);
-    draw_shelf_status(frame, status_area, shelf, theme);
+    if status_area.height > 0 {
+        draw_shelf_status(frame, status_area, shelf, theme);
+    }
 
     if shelf.mode == crate::shelf::Mode::Help {
         draw_shelf_help(frame, list_area, theme);
@@ -613,11 +754,20 @@ fn draw_shelf_status(
 
     let shown = shelf.entries().len();
     let total = shelf.total();
-    let left = match shelf.status() {
+    let full = match shelf.status() {
         Some(message) => message.to_string(),
         None => shelf_summary(shown, total, shelf.filter()),
     };
-    let right = i18n::fill("by {}  ·  ? for keys", &[&i18n::t(shelf.order().label())]);
+    // The count of books is the one thing the row must say, so on a narrow
+    // shelf the hint gives way, and the count is cut rather than either pushing
+    // the other off the row.
+    let right = if area.width as usize >= SHELF_HINTS_MIN {
+        i18n::fill("by {}  ·  ? for keys", &[&i18n::t(shelf.order().label())])
+    } else {
+        String::new()
+    };
+    let room = (area.width as usize).saturating_sub(SIDE_MARGIN as usize * 2 + cells(&right) + 1);
+    let left = fit(&full, room);
     let gap = area
         .width
         .saturating_sub(cells(&left) as u16 + cells(&right) as u16 + SIDE_MARGIN * 2)
@@ -703,11 +853,17 @@ pub fn draw_hits(
     scroll: usize,
     theme: &crate::theme::Theme,
 ) {
+    if too_small(frame.area()) {
+        draw_too_small(frame, frame.area());
+        return;
+    }
+
     let (list_area, status_area) = split_frame(frame.area());
+    let edge = margin(list_area.width);
     let inner = Rect {
-        x: list_area.x + SIDE_MARGIN,
+        x: list_area.x + edge,
         y: list_area.y,
-        width: list_area.width.saturating_sub(SIDE_MARGIN * 2),
+        width: list_area.width.saturating_sub(edge * 2),
         height: list_area.height,
     };
 
@@ -756,6 +912,9 @@ pub fn draw_hits(
         )));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+    if status_area.height == 0 {
+        return;
+    }
 
     let source = match results.source {
         crate::find::Source::Index => i18n::t("qmd index"),
@@ -818,6 +977,70 @@ mod tests {
     }
 
     #[test]
+    fn text_is_cut_only_when_it_does_not_fit() {
+        assert_eq!(fit("short", 10), "short");
+        assert_eq!(
+            fit("一九七三年的弹子球", 12),
+            cut("一九七三年的弹子球", 12),
+            "a text that overflows is marked where it was cut"
+        );
+        assert_eq!(fit("anything", 0), "", "no room says nothing at all");
+    }
+
+    /// Every row of a shelf drawn into a test terminal, one line to a string.
+    fn shelf_text(width: u16, height: u16) -> String {
+        let mut shelf = crate::shelf::Shelf::new(&State::default());
+        let theme = crate::theme::Theme::default();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_shelf(frame, &mut shelf, &theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn only_a_single_cell_gets_the_face() {
+        let text = shelf_text(2, 1);
+        assert!(text.contains(":("), "{text:?}");
+        let room = shelf_text(4, 2);
+        assert!(!room.contains(":("), "two rows are a page: {room:?}");
+    }
+
+    #[test]
+    fn a_small_frame_gives_its_only_rows_to_the_page() {
+        // The status row is the first thing to go, so a shelf too short for
+        // both the count and the books still shows the books.
+        let tall = shelf_text(60, 6);
+        assert!(tall.contains('0'), "the count is there: {tall:?}");
+        let short = shelf_text(60, 3);
+        assert!(
+            !short.contains('0'),
+            "the row is given to the page: {short:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_shelf_keeps_the_count_but_drops_the_hint() {
+        // The hint writes the one mark the count never does, so it is what
+        // tells the two rows apart whatever language this machine reads.
+        let wide = shelf_text(60, 6);
+        assert!(wide.contains('?'), "{wide:?}");
+        assert!(wide.contains('0'), "{wide:?}");
+
+        let narrow = shelf_text(30, 6);
+        assert!(narrow.contains('0'), "the count stays: {narrow:?}");
+        assert!(!narrow.contains('?'), "the hint goes: {narrow:?}");
+    }
+
+    #[test]
     fn the_shelf_says_how_many_books_there_are_and_what_the_filter_is() {
         // Which of the two keys was asked for, not what it says: this machine
         // may read Chinese, and only the choice of template is under test.
@@ -843,7 +1066,7 @@ mod tests {
     /// 10 cells wide and two down at an 8x16 cell — a mark, narrower than any
     /// room the test gives it, and in the flow of text rather than a cover, so
     /// it keeps that size.
-    fn picture_book(path: &std::path::Path) {
+    fn picture_book(path: &std::path::Path, title: &str) {
         use std::io::Write;
         let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
             80,
@@ -867,17 +1090,17 @@ mod tests {
 <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
 </container>"#,
         );
-        write(
-            "OEBPS/content.opf",
-            br#"<?xml version="1.0"?>
+        let opf = format!(
+            r#"<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
-<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Centre</dc:title></metadata>
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title></metadata>
 <manifest>
   <item id="c0" href="ch0.xhtml" media-type="application/xhtml+xml"/>
   <item id="art" href="art.png" media-type="image/png"/>
 </manifest>
-<spine><itemref idref="c0"/></spine></package>"#,
+<spine><itemref idref="c0"/></spine></package>"#
         );
+        write("OEBPS/content.opf", opf.as_bytes());
         write(
             "OEBPS/ch0.xhtml",
             br#"<?xml version="1.0"?>
@@ -898,7 +1121,7 @@ mod tests {
         // and a pixel escape is emitted there — or one backend would draw
         // the same book differently from another.
         let book = std::env::temp_dir().join("omaread-ui-centre.epub");
-        picture_book(&book);
+        picture_book(&book, "Centre");
         for backend in [
             crate::image::Backend::HalfBlocks,
             crate::image::Backend::Kitty,
@@ -968,6 +1191,93 @@ mod tests {
             }
             std::fs::remove_dir_all(&dir).ok();
         }
+        std::fs::remove_file(book).ok();
+    }
+
+    #[test]
+    fn a_picture_shrinks_into_a_small_frame() {
+        // Images do not only grow into the room: one too big for a small window
+        // shrinks to fit it, so the picture stays instead of vanishing.
+        let book = std::env::temp_dir().join("omaread-ui-shrink.epub");
+        picture_book(&book, "Shrink");
+        let dir = std::env::temp_dir().join("omaread-ui-shrink-journal");
+        std::fs::remove_dir_all(&dir).ok();
+        let mut app = App::new(
+            Book::open(&book).unwrap(),
+            BookId::of_file(&book).unwrap(),
+            Journal::open(&dir).unwrap(),
+            &State::default(),
+            LayoutOptions {
+                max_width: u16::MAX,
+            },
+        )
+        .unwrap();
+        app.set_image_backend(
+            crate::image::Backend::HalfBlocks,
+            crate::image::CellSize {
+                width: 8,
+                height: 16,
+            },
+        );
+
+        for (width, height) in [(40u16, 12u16), (12, 6), (5, 4)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(frame, &mut app);
+                })
+                .unwrap();
+            let drawn = app
+                .visible_lines()
+                .iter()
+                .filter(|line| matches!(line.kind, LineKind::Image { .. }))
+                .count();
+            assert!(drawn >= 1, "{width}x{height}: the picture is still there");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(book).ok();
+    }
+
+    #[test]
+    fn the_progress_survives_a_long_title_in_a_narrow_frame() {
+        // The bug this guards: a title longer than the row used to run on and
+        // push the progress off the right edge, so a small window showed where
+        // you were in the book as nothing at all.
+        let book = std::env::temp_dir().join("omaread-ui-progress.epub");
+        picture_book(&book, "The Long And Winding Book Title");
+        let dir = std::env::temp_dir().join("omaread-ui-progress-journal");
+        std::fs::remove_dir_all(&dir).ok();
+        let mut app = App::new(
+            Book::open(&book).unwrap(),
+            BookId::of_file(&book).unwrap(),
+            Journal::open(&dir).unwrap(),
+            &State::default(),
+            LayoutOptions {
+                max_width: u16::MAX,
+            },
+        )
+        .unwrap();
+
+        // The narrowest frame that still carries a status row.
+        let mut terminal = Terminal::new(TestBackend::new(STATUS_MIN_WIDTH, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let status: String = (0..STATUS_MIN_WIDTH)
+            .map(|x| buffer.cell((x, 5)).map(|c| c.symbol()).unwrap_or(" "))
+            .collect();
+        assert!(status.contains('/'), "the position is kept: {status:?}");
+        assert!(status.contains('%'), "the percentage is kept: {status:?}");
+        // The title is what gives way, with the mark that says it did.
+        assert!(
+            status.contains('…'),
+            "the title is cut, not dropped: {status:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(book).ok();
     }
 }

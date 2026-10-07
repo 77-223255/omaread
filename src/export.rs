@@ -184,16 +184,11 @@ fn quote(value: &str) -> String {
 /// The aim is searchable prose, not a faithful copy: headings keep their level so
 /// a hit can be placed in the book's structure, code stays fenced so it is not
 /// mistaken for text, and images become their alt text.
-#[cfg(test)]
-pub fn chapter_markdown(chapter: &Chapter) -> String {
-    chapter_markdown_titled(chapter, None, None)
-}
-
-/// As `chapter_markdown`, with a title line naming book and chapter.
 ///
-/// Search engines show a document's first heading as the title of a hit, and
-/// "34" or "Pattern: Snapshots" alone says nothing about the book. The chapter's
-/// own headings move down one level so the document has a single title with the
+/// A title line naming book and chapter is added when one is given. Search
+/// engines show a document's first heading as the title of a hit, and "34" or
+/// "Pattern: Snapshots" alone says nothing about the book. The chapter's own
+/// headings move down one level so the document has a single title with the
 /// chapter's structure beneath it. Replacing the first heading instead would go
 /// wrong wherever a book splits number and title across two of them.
 pub fn chapter_markdown_titled(
@@ -341,6 +336,11 @@ pub fn default_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::doc::{Block, Run, RunStyle};
+
+    /// Turns a chapter into Markdown without a title line of its own.
+    fn chapter_markdown(chapter: &Chapter) -> String {
+        chapter_markdown_titled(chapter, None, None)
+    }
 
     fn block(kind: BlockKind, text: &str) -> Block {
         Block {

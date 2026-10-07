@@ -72,7 +72,7 @@ enum Command {
         #[arg(long, value_name = "TEXT")]
         filter: Option<String>,
     },
-    /// Add the books of a directory to the library
+    /// Add the books of a directory to the library, and notice moved ones
     Scan {
         /// The directory to look through, and everything below it
         #[arg(value_name = "DIR")]
@@ -400,14 +400,13 @@ fn forget_under(root: &Path, state: &State, journal_dir: &Path) -> Result<()> {
     // hidden — the reading position goes with it, and nothing puts it back. A
     // shelf *under* the home directory is what this is for; the home directory,
     // and anything above it, is not.
-    if let Some(home) = dirs::home_dir() {
-        if home.starts_with(&root) {
+    if let Some(home) = dirs::home_dir()
+        && home.starts_with(&root) {
             bail!(
                 "{} holds your home directory: name the shelf inside it",
                 shown(root.display())
             );
         }
-    }
     let chosen: Vec<(BookId, String)> = state
         .books()
         .filter(|(_, record)| record.paths.iter().any(|path| path.starts_with(&root)))
@@ -483,8 +482,8 @@ fn metadata(reference: &str, journal_dir: &Path, fields: &Fields, json: bool) ->
 }
 
 /// Shows what the library holds about one book, or records the correction
-/// asked for. Both live here because `set` with nothing to set is how a book
-/// gets looked at.
+/// asked for. Both live here because `show` is `known_book` with no fields to
+/// set: one path, so what is printed and what is written cannot drift apart.
 fn known_book(
     state: &State,
     journal_dir: &Path,
@@ -714,8 +713,7 @@ fn browse() -> Result<()> {
             let mut shelf = shelf::Shelf::new(&state);
             if shelf.total() == 0 {
                 ratatui::restore();
-                println!("The library is empty. Read one in with:");
-                println!("  omaread scan ~/path/to/books");
+                empty_library_hint();
                 return Ok(());
             }
 
@@ -914,6 +912,19 @@ fn export_library(dir: &str, force: bool, reindex: bool, embed: bool) -> Result<
     Ok(())
 }
 
+/// The command that points qmd at an export directory, spelled once so the
+/// several places that print it cannot drift apart.
+fn qmd_collection_hint(dir: &Path) -> String {
+    format!("  qmd collection add {} --name books", shown(dir.display()))
+}
+
+/// The one way to say the library has nothing in it, wherever a command finds
+/// it empty.
+fn empty_library_hint() {
+    println!("The library is empty. Read one in with:");
+    println!("  omaread scan ~/path/to/books");
+}
+
 /// The advice that follows an export: how to hand what it wrote to qmd, and
 /// the command that does both halves itself.
 ///
@@ -925,7 +936,7 @@ fn indexing_advice(dir: &Path, wrote: bool) -> Vec<String> {
     vec![
         String::new(),
         "To index it:".to_string(),
-        format!("  qmd collection add {} --name books", shown(dir.display())),
+        qmd_collection_hint(dir),
         "  qmd embed".to_string(),
         String::new(),
         "Or let omaread do it: omaread export --reindex [--embed]".to_string(),
@@ -944,12 +955,12 @@ fn run_qmd(dir: &Path, embed: bool) -> Result<()> {
         Ok(status) if status.success() => {}
         Ok(_) => {
             println!("\nqmd update did not succeed. If no collection points here yet:");
-            println!("  qmd collection add {} --name books", shown(dir.display()));
+            println!("{}", qmd_collection_hint(dir));
             return Ok(());
         }
         Err(err) => {
             println!("\ncannot run qmd: {err}");
-            println!("  qmd collection add {} --name books", shown(dir.display()));
+            println!("{}", qmd_collection_hint(dir));
             return Ok(());
         }
     }
@@ -1103,7 +1114,7 @@ fn shellexpand(path: &str) -> String {
 }
 
 /// Reads a directory into the library.
-fn scan_directory(dir: &PathBuf, filenames: bool) -> Result<()> {
+fn scan_directory(dir: &Path, filenames: bool) -> Result<()> {
     // A path that is not a directory is a typo half the time, and `0 files seen`
     // with a zero exit is how it went unnoticed.
     if !dir.is_dir() {
@@ -1119,7 +1130,7 @@ fn scan_directory(dir: &PathBuf, filenames: bool) -> Result<()> {
     let report = library::scan(dir, &mut journal, &state, filenames, &mut |path| {
         count += 1;
         // A scan over hundreds of files should say that it is working.
-        if count % 25 == 0 {
+        if count.is_multiple_of(25) {
             println!("  {count} files ... {}", shown(path.display()));
         }
     })?;
@@ -1157,8 +1168,7 @@ fn list_library(as_json: bool, needle: &str) -> Result<()> {
     }
     if entries.is_empty() {
         if needle.trim().is_empty() {
-            println!("The library is empty. Read one in with:");
-            println!("  omaread scan ~/path/to/books");
+            empty_library_hint();
         } else {
             println!("{}", library::no_match(needle));
         }
@@ -1361,7 +1371,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
     // already gone and the new one's are not rendered yet.
     let mut pixels_on_screen = false;
 
-    while !app.should_quit {
+    while !app.should_leave_book {
         // Pixel pictures are not part of the cell buffer, so a diffed redraw
         // leaves them wherever no character happens to overwrite them. Once the
         // view has moved, the screen has to be wiped and painted afresh.
@@ -1398,7 +1408,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                 // pictures can be painted. Drawing each one would wipe the
                 // screen that often, so what is already waiting is taken now
                 // and shown as one frame.
-                while !app.should_quit && event::poll(std::time::Duration::ZERO)? {
+                while !app.should_leave_book && event::poll(std::time::Duration::ZERO)? {
                     match event::read()? {
                         Event::Key(next) if next.kind == KeyEventKind::Press => {
                             app.handle_key(next)
@@ -1835,7 +1845,10 @@ mod tests {
             "nothing written, nothing to index"
         );
         let advice = indexing_advice(dir, true);
-        assert_eq!(advice.len(), 6, "{advice:?}");
+        assert!(
+            advice.iter().any(|line| line.contains("qmd collection add")),
+            "the advice names the command that creates the collection: {advice:?}"
+        );
         // The advice names the command it belongs to, not a bare flag.
         assert!(
             advice
@@ -1901,7 +1914,6 @@ mod tests {
         let entry = library::Entry {
             id: id.clone(),
             record,
-            started: false,
         };
 
         let state = journal::State::default();

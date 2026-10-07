@@ -88,8 +88,10 @@ pub fn parse_in(xml: &str, base: &str) -> Result<Parsed> {
     let doc = Document::parse_with_options(&cleaned, parsing_options())
         .context("chapter is not well-formed XML")?;
 
-    let mut walker = Walker::default();
-    walker.base = base.to_string();
+    let mut walker = Walker {
+        base: base.to_string(),
+        ..Walker::default()
+    };
     let body = doc
         .descendants()
         .find(|n| n.is_element() && local_name(*n) == "body")
@@ -303,8 +305,8 @@ impl Walker {
         if let Some(inline) = inline_style(name) {
             // A link is recorded with the range it covers, so the cursor can tell
             // whether it stands on one.
-            if name == "a" {
-                if let Some(href) = node.attribute("href").filter(|h| !h.trim().is_empty()) {
+            if name == "a"
+                && let Some(href) = node.attribute("href").filter(|h| !h.trim().is_empty()) {
                     let block = self.blocks.len();
                     let start = self.current.char_count();
                     self.walk_children(node, style.merged(inline));
@@ -321,7 +323,6 @@ impl Walker {
                     }
                     return;
                 }
-            }
             self.walk_children(node, style.merged(inline));
             return;
         }
@@ -444,11 +445,10 @@ fn start_ordinal(node: Node) -> usize {
 pub(super) fn collect_raw_text(node: Node) -> String {
     let mut out = String::new();
     for descendant in node.descendants() {
-        if descendant.is_text() {
-            if let Some(text) = descendant.text() {
+        if descendant.is_text()
+            && let Some(text) = descendant.text() {
                 out.push_str(text);
             }
-        }
     }
     out
 }

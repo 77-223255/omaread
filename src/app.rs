@@ -14,7 +14,7 @@ pub enum Mode {
     /// Scrolling and reading. `j` and `k` move the page.
     Reading,
     /// A cursor sits in the text. `j` and `k` move the cursor.
-    Normal,
+    Cursor,
     Contents,
     /// The key bindings.
     Help,
@@ -76,7 +76,9 @@ pub struct App {
     cursor: Option<Cursor>,
     pending: Option<char>,
     status: Option<String>,
-    pub should_quit: bool,
+    /// True when the reader left the book, either back to the shelf or out of
+    /// the program entirely.
+    pub should_leave_book: bool,
     /// True when the reader was left for good rather than to pick another book.
     pub should_quit_program: bool,
     options: LayoutOptions,
@@ -180,7 +182,7 @@ impl App {
             cursor: None,
             pending: None,
             status: None,
-            should_quit: false,
+            should_leave_book: false,
             should_quit_program: false,
             options,
             id,
@@ -313,14 +315,14 @@ impl App {
         self.images.clear();
         self.image_slots.clear();
         self.image_box = (0, 0);
-        if width < 8 {
+        if width == 0 {
             return;
         }
         // A picture belongs in the same column as the text, so it is measured
         // against the same width: `layout_full` narrows the window this way
         // too. Given the whole window instead, a picture broke out of the text
         // on both counts, too wide and, scaled in proportion, too tall.
-        let width = width.min(self.options.max_width).max(8);
+        let width = width.min(self.options.max_width).max(1);
         // The room is the whole text area: the viewport with its one status
         // row taken off, which is what `view_height` already counts. The
         // status line is the only row a picture never gets, so a picture may
@@ -506,11 +508,12 @@ impl App {
     // ----- layout -----
 
     /// Rebuilds the layout when the view size changed, keeping the reading
-    /// position. Called before each draw. `height` is the whole viewport: the
-    /// status row comes off here, so the text area the layout builds and the
-    /// room pictures are measured for are the same rows the view draws in.
-    pub fn prepare(&mut self, width: u16, height: u16) {
-        self.view_height = text_rows(height).max(1);
+    /// position. Called before each draw. `rows` is the text area alone: the
+    /// status row is already off, or there was never room for one, and the
+    /// view tells the reader how many rows it drew the page in so the room
+    /// pictures are measured for and the rows they are drawn in are one number.
+    pub fn prepare(&mut self, width: u16, rows: u16) {
+        self.view_height = rows.max(1);
         if width == self.laid_out_for && !self.lines.is_empty() {
             self.clamp_scroll();
             // Scrolling moved other pictures into view, even though the layout
@@ -619,14 +622,13 @@ impl App {
     // ----- keys -----
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        if let Some(first) = self.pending.take() {
-            if self.handle_sequence(first, key) {
+        if let Some(first) = self.pending.take()
+            && self.handle_sequence(first, key) {
                 return;
             }
-        }
         match self.mode {
             Mode::Reading => self.handle_reading_key(key),
-            Mode::Normal => self.handle_cursor_key(key),
+            Mode::Cursor => self.handle_cursor_key(key),
             Mode::Contents => self.handle_contents_key(key),
             Mode::Search => self.handle_search_key(key),
             // Any key closes the help; there is nothing to do in it.
@@ -642,7 +644,7 @@ impl App {
             ('g', KeyCode::Char('g')) => {
                 match self.mode {
                     Mode::Contents => self.contents_cursor = 0,
-                    Mode::Normal => {
+                    Mode::Cursor => {
                         self.cursor = self.first_cursor();
                         self.follow_cursor();
                     }
@@ -669,9 +671,9 @@ impl App {
             // Vim user expects, and it must never end the session by accident.
             // `q` leaves the book. Coming from the library that means going
             // back to it; started with a file it means leaving.
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.should_leave_book = true,
             KeyCode::Char('Q') => {
-                self.should_quit = true;
+                self.should_leave_book = true;
                 self.should_quit_program = true;
             }
             KeyCode::Esc => self.dismiss(),
@@ -709,7 +711,7 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.leave_normal_mode(),
             KeyCode::Char('Q') => {
-                self.should_quit = true;
+                self.should_leave_book = true;
                 self.should_quit_program = true;
             }
             KeyCode::Char('i') => self.leave_normal_mode(),
@@ -818,7 +820,7 @@ impl App {
     }
 
     fn enter_normal_mode(&mut self) {
-        self.mode = Mode::Normal;
+        self.mode = Mode::Cursor;
         if self.cursor.is_none() || !self.cursor_is_visible() {
             // Start at the top of the view, where the eye already is.
             self.cursor = Index::new(&self.lines)
@@ -859,14 +861,13 @@ impl App {
             }
         } else if cursor.column > 0 {
             cursor.column -= 1;
-        } else if cursor.line > 0 {
-            if let Some(previous) = index.previous_selectable(cursor.line - 1) {
+        } else if cursor.line > 0
+            && let Some(previous) = index.previous_selectable(cursor.line - 1) {
                 cursor = Cursor {
                     line: previous,
                     column: self.lines[previous].text_len().saturating_sub(1),
                 };
             }
-        }
         self.cursor = Some(cursor);
         self.status = None;
         self.follow_cursor();
@@ -1052,7 +1053,7 @@ impl App {
         // Land at the target with a cursor, so the next link is one keypress
         // away and Ctrl-o has something to return to.
         self.pending_cursor = Some((landing.0, landing.1));
-        self.mode = Mode::Normal;
+        self.mode = Mode::Cursor;
         self.pending_restore = Some(Locator {
             href: self.chapter.href.clone(),
             block: landing.0,
@@ -1101,27 +1102,18 @@ impl App {
             self.status = Some(i18n::t("nowhere to go back to").into());
             return;
         };
-        if let Some(index) = self.find_in_spine(&back.view.href) {
-            if index != self.chapter_index {
+        if let Some(index) = self.find_in_spine(&back.view.href)
+            && index != self.chapter_index {
                 // Going back must not push another entry onto the stack.
-                self.chapter_index = index;
-                self.chapter = load_chapter(&mut self.book, index);
-                self.images.clear();
-                // This chapter's pictures have not been tried yet.
-                self.unreadable.clear();
-                self.contents_cursor = index;
-                self.cursor = None;
-                if self.search.is_active() {
-                    self.search.scan(&self.chapter);
-                }
+                let chapter = load_chapter(&mut self.book, index);
+                self.open_chapter(index, chapter);
             }
-        }
         self.pending_restore = Some(back.view);
         self.pending_cursor = back.cursor;
         // Coming back into the text means the cursor is wanted, so the mode
         // follows it rather than dropping to plain reading.
         if back.cursor.is_some() && self.mode == Mode::Reading {
-            self.mode = Mode::Normal;
+            self.mode = Mode::Cursor;
         }
         self.laid_out_for = 0;
         self.lines.clear();
@@ -1177,14 +1169,7 @@ impl App {
             }
             // Found one: move there and pick the first or last match.
             self.save_position();
-            self.chapter_index = index;
-            self.chapter = chapter;
-            self.contents_cursor = index;
-            self.images.clear();
-            // This chapter's pictures have not been tried yet.
-            self.unreadable.clear();
-            self.cursor = None;
-            self.search.scan(&self.chapter);
+            self.open_chapter(index, chapter);
             if forward {
                 self.search.go_to_first();
             } else {
@@ -1201,7 +1186,7 @@ impl App {
 
     /// Scrolls to the match the reader is on and reports which it is.
     fn show_current_match(&mut self) {
-        let Some((block, offset)) = self.search.current_position() else {
+        let Some((block, offset)) = self.search.current() else {
             return;
         };
         self.pending_restore = Some(Locator {
@@ -1245,8 +1230,23 @@ impl App {
             return;
         }
         self.save_position();
+        let chapter = load_chapter(&mut self.book, index);
+        self.open_chapter(index, chapter);
+        self.scroll = 0;
+        if self.mode == Mode::Cursor {
+            self.mode = Mode::Reading;
+        }
+        self.status = None;
+    }
+
+    /// Installs the chapter at `index`, already parsed as `chapter`, and forgets
+    /// the last chapter's pictures. A standing search is re-run over the new
+    /// text, the cursor is dropped, and the layout is marked stale so the next
+    /// draw rebuilds it. Where to stand — the top, a restored position, a match
+    /// — is the caller's business: those differ while the rest does not.
+    fn open_chapter(&mut self, index: usize, chapter: Chapter) {
         self.chapter_index = index;
-        self.chapter = load_chapter(&mut self.book, index);
+        self.chapter = chapter;
         self.images.clear();
         // This chapter's pictures have not been tried yet.
         self.unreadable.clear();
@@ -1254,15 +1254,9 @@ impl App {
             self.search.scan(&self.chapter);
         }
         self.contents_cursor = index;
-        self.scroll = 0;
         self.cursor = None;
-        if self.mode == Mode::Normal {
-            self.mode = Mode::Reading;
-        }
-        // Force a rebuild on the next draw.
         self.laid_out_for = 0;
         self.lines.clear();
-        self.status = None;
     }
 }
 
@@ -1314,7 +1308,7 @@ pub fn bindings() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
 /// Splits a link target into its file part and its fragment.
 fn split_target(target: &str) -> (&str, Option<&str>) {
     match target.split_once('#') {
-        Some((file, fragment)) if fragment.is_empty() => (file, None),
+        Some((file, "")) => (file, None),
         Some((file, fragment)) => (file, Some(fragment)),
         None => (target, None),
     }
@@ -1564,7 +1558,7 @@ mod tests {
 
         // First frame: the header is believed and the block gets its rows —
         // only for as long as it takes to find out that the bytes are bad.
-        app.prepare(80, 24);
+        app.prepare(80, 23);
         assert_eq!(
             app.image_slots.len(),
             1,
@@ -1579,14 +1573,14 @@ mod tests {
 
         // The rebuilt layout: the picture's rows are gone — only the one row
         // of alt text is left — and there is no second attempt.
-        app.prepare(80, 24);
+        app.prepare(80, 23);
         assert!(app.image_slots.is_empty(), "the block reserves nothing");
         assert_eq!(
             picture_rows(&app, block),
             1,
             "the rows went back to the text, leaving the alt text"
         );
-        app.prepare(80, 24);
+        app.prepare(80, 23);
         assert!(
             app.image_slots.is_empty(),
             "the chapter does not try those bytes again"

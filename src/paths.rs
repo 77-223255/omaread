@@ -151,14 +151,14 @@ pub fn data_dir() -> Result<PathBuf> {
 }
 
 /// Replaces a leading `~` with the home directory.
-fn expand_tilde(path: &PathBuf) -> PathBuf {
+fn expand_tilde(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     match text.strip_prefix("~/") {
         Some(rest) => match dirs::home_dir() {
             Some(home) => home.join(rest),
-            None => path.clone(),
+            None => path.to_path_buf(),
         },
-        None => path.clone(),
+        None => path.to_path_buf(),
     }
 }
 
@@ -168,6 +168,13 @@ pub fn hostname() -> String {
     let raw = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
         .unwrap_or_default();
+    filename_safe(&raw)
+}
+
+/// Turns a hostname into something a file name may hold: every character that
+/// is not a letter, a digit or a dash becomes an underscore, and a name with
+/// nothing left in it becomes a fixed one.
+fn filename_safe(raw: &str) -> String {
     let name: String = raw
         .trim()
         .chars()
@@ -191,13 +198,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hostname_is_usable_in_a_filename() {
-        let name = hostname();
-        assert!(!name.is_empty());
-        assert!(
-            name.chars()
-                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-        );
+    fn a_hostname_becomes_a_name_a_file_can_hold() {
+        // Whatever the machine is called, the journal's name is a file name:
+        // a slash or a space must not become a directory or a second word.
+        assert_eq!(filename_safe("my host/name.v2\n"), "my_host_name_v2");
+        assert_eq!(filename_safe("box-1"), "box-1");
+        assert_eq!(filename_safe("   "), "unknown-host");
     }
 
     #[test]

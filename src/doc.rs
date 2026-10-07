@@ -143,8 +143,8 @@ impl RunBuilder {
         self.runs.iter().all(|r| r.text.trim().is_empty())
     }
 
-    /// Returns the runs unchanged. For code, where leading spaces are the
-    /// indentation and must survive.
+    /// Returns the runs with empty ones dropped. For code, where leading spaces
+    /// are the indentation and must survive.
     pub fn finish_verbatim(mut self) -> Vec<Run> {
         self.runs.retain(|r| !r.text.is_empty());
         self.runs

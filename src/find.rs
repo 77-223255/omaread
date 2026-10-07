@@ -53,15 +53,14 @@ pub fn find(
     limit: usize,
     report: &mut dyn FnMut(&str),
 ) -> Result<Results> {
-    if let Some(hits) = try_qmd(query, state, limit) {
-        if !hits.is_empty() {
+    if let Some(hits) = try_qmd(query, state, limit)
+        && !hits.is_empty() {
             return Ok(Results {
                 hits,
                 source: Source::Index,
                 query: query.to_string(),
             });
         }
-    }
     let hits = search_directly(query, state, limit, report)?;
     Ok(Results {
         hits,

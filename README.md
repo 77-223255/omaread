@@ -70,17 +70,19 @@ author the library knows, or a file on disk.
 | Command | |
 | --- | --- |
 | `omaread` | read the library |
-| `omaread BOOK [--chapter N] [--at TEXT]` | read one book, at a place |
+| `omaread BOOK [--chapter N\|HREF] [--at TEXT]` | read one book, at a place |
 | `omaread list [--json] [--filter TEXT]` | the library as a table |
-| `omaread scan DIR [--filenames]` | add new books, notice moved ones |
+| `omaread scan DIR [--filenames]` | add the books of a directory to the library, and notice moved ones |
 | `omaread show BOOK [--json]` | what a book says about itself |
-| `omaread set BOOK field=value …` | correct it, without touching the file |
-| `omaread forget BOOK` | take a book (or a directory of them) out |
-| `omaread find TEXT` | search the whole library and open the hit |
-| `omaread export [DIR] [--force] [--reindex] [--embed]` | Markdown, one file per chapter |
-| `omaread inspect BOOK` | spine and chapter sizes |
-| `omaread images BOOK` | the pictures, and their own pixel sizes |
-| `omaread blocks N BOOK` | the parsed blocks of one chapter |
+| `omaread set BOOK field=value …` | correct what a book says about itself, without touching the file |
+| `omaread forget BOOK` | take a book, or a whole shelf, out of the library |
+| `omaread find TEXT` | search the whole library and read the hit |
+| `omaread export [DIR] [--force] [--reindex] [--embed]` | write the library as Markdown, one file per chapter |
+| `omaread inspect BOOK` | what a book file holds, without the library |
+| `omaread images BOOK` | the pictures in a book file, and how big each one is |
+| `omaread blocks N BOOK` | the parsed blocks of one chapter of a book file |
+| `omaread help [COMMAND]` | the same summary, or one command's own help |
+| `omaread --version` | the version |
 
 `set` fields: `title`, `authors`, `series`, `series-index`, `tags`, `rating`,
 `publisher`, `year`, `language`. An empty value clears the field. A correction
@@ -98,14 +100,20 @@ Settings live in `~/.config/omaread/config.toml`, written with comments on
 first start:
 
 ```toml
-# Where the journal lives; point it at a synced folder to carry your
-# reading position between machines. Each machine writes only its own file.
-# journal_dir = "~/Dropbox/omaread/journal"
+# omaread settings
 
-# Reading width in columns; leave out for the whole window.
+# Where the journal lives. It is the source of truth for reading
+# positions. Point this at a synchronised folder to
+# carry your reading position between machines. Each machine writes
+# only its own file, so no conflict can arise.
+# journal_dir = "~/.local/share/omaread/journal"
+
+# Reading width in columns. Comment out to use the full window.
 # max_width = 66
 
-# Picture backend: kitty, sixel or half-blocks; leave out to ask the terminal.
+# How pictures are drawn. Left out, the terminal is asked and the
+# best of kitty, sixel and half-blocks is used. Inside tmux only
+# half-blocks work, because tmux manages the screen itself.
 # images = "sixel"
 ```
 

@@ -396,7 +396,7 @@ fn find_package_path(archive: &mut ZipArchive<File>) -> Result<String> {
     doc.descendants()
         .find(|n| n.is_element() && n.tag_name().name() == "rootfile")
         .and_then(|n| n.attribute("full-path"))
-        .map(|p| percent_decode(p))
+        .map(percent_decode)
         .ok_or_else(|| anyhow!("container.xml names no package document"))
 }
 
@@ -500,14 +500,13 @@ fn parse_package(xml: &str) -> Result<Package> {
             // that merely *contains* `cover` — `my-coverish` — points at some
             // other section of the book, and believing it made a stranger's
             // section the cover.
-            "reference" => {
+            "reference"
                 if node
                     .attribute("type")
                     .is_some_and(|kind| kind.eq_ignore_ascii_case("cover"))
-                {
+                => {
                     guide_cover = node.attribute("href").map(str::to_string);
                 }
-            }
             _ => {}
         }
     }
@@ -532,14 +531,13 @@ fn parse_package(xml: &str) -> Result<Package> {
                 .and_then(|id| manifest.get(id))
                 .map(|item| item.href.clone())
         })
-        .or_else(|| guide_cover);
+        .or(guide_cover);
 
     // EPUB 2 points at the NCX through the spine's `toc` attribute.
-    if ncx_href.is_none() {
-        if let Some(id) = spine_toc_id {
+    if ncx_href.is_none()
+        && let Some(id) = spine_toc_id {
             ncx_href = manifest.get(&id).map(|item| item.href.clone());
         }
-    }
 
     Ok(Package {
         metadata,

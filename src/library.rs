@@ -20,10 +20,6 @@ use std::path::{Path, PathBuf};
 pub struct Entry {
     pub id: BookId,
     pub record: BookRecord,
-    /// True when the reader has been in this book: a position is recorded for
-    /// it. The shelf marks those rows, and nothing needs the share read — the
-    /// reader is the only place that knows it, and only while it is open.
-    pub started: bool,
 }
 
 /// The one sentence for a reference that picked out no book.
@@ -216,7 +212,6 @@ pub fn entries(state: &State) -> Vec<Entry> {
         .map(|(id, record)| Entry {
             id: id.clone(),
             record: record.clone(),
-            started: state.position(id).is_some(),
         })
         .collect()
 }
@@ -466,11 +461,10 @@ fn walk(dir: &Path, found: &mut Vec<PathBuf>, depth: usize) {
         }
         match entry.file_type() {
             Ok(kind) if kind.is_dir() => walk(&path, found, depth + 1),
-            Ok(kind) if kind.is_file() => {
-                if is_book(&path) {
+            Ok(kind) if kind.is_file()
+                && is_book(&path) => {
                     found.push(path);
                 }
-            }
             _ => {}
         }
     }
@@ -602,7 +596,6 @@ mod tests {
         Entry {
             id: BookId::from(format!("sha256:{title}")),
             record,
-            started: false,
         }
     }
 

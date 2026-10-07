@@ -127,13 +127,12 @@ impl Shelf {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
-        if let Some(first) = self.pending.take() {
-            if first == 'g' && key.code == KeyCode::Char('g') {
+        if let Some(first) = self.pending.take()
+            && first == 'g' && key.code == KeyCode::Char('g') {
                 self.cursor = 0;
                 self.follow_cursor();
                 return Action::None;
             }
-        }
         match self.mode {
             Mode::Browse => self.handle_browse_key(key),
             Mode::Filter => {
@@ -296,7 +295,6 @@ mod tests {
                 Entry {
                     id: BookId::from(format!("sha256:{i}")),
                     record,
-                    started: false,
                 }
             })
             .collect();

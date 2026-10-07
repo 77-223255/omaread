@@ -71,8 +71,8 @@ fn nearest(palette: &[(u8, u8, u8)], pixel: (u8, u8, u8)) -> usize {
     let mut best_distance = distance(palette[cube], pixel);
 
     let greys = LEVELS * LEVELS * LEVELS;
-    for index in greys..palette.len() {
-        let candidate = distance(palette[index], pixel);
+    for (index, colour) in palette.iter().enumerate().skip(greys) {
+        let candidate = distance(*colour, pixel);
         if candidate < best_distance {
             best_distance = candidate;
             best = index;
@@ -125,8 +125,8 @@ pub fn encode(image: &RgbaImage) -> String {
     let bands = height.div_ceil(6);
     for band in 0..bands {
         let mut first_colour = true;
-        for colour in 0..palette.len() {
-            if !used[colour] {
+        for (colour, is_used) in used.iter().enumerate() {
+            if !is_used {
                 continue;
             }
             // Collect this colour's pixels across the band.

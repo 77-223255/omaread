@@ -27,11 +27,10 @@ impl Lang {
     /// Reads the language out of the usual variables.
     pub fn detect() -> Self {
         for name in ["LC_ALL", "LC_MESSAGES", "LANG"] {
-            if let Ok(value) = std::env::var(name) {
-                if let Some(lang) = Self::from_locale(&value) {
+            if let Ok(value) = std::env::var(name)
+                && let Some(lang) = Self::from_locale(&value) {
                     return lang;
                 }
-            }
         }
         Self::En
     }
@@ -247,11 +246,10 @@ mod tests {
                 Some(rest) => rest,
                 None => continue,
             };
-            if let Some(inner) = rest.strip_prefix('"') {
-                if let Some(end) = inner.find('"') {
+            if let Some(inner) = rest.strip_prefix('"')
+                && let Some(end) = inner.find('"') {
                     keys.push(inner[..end].to_string());
                 }
-            }
         }
         keys
     }

@@ -166,8 +166,7 @@ impl<'a> Index<'a> {
             .iter()
             .enumerate()
             .take(from + 1)
-            .filter(|(_, l)| l.is_selectable())
-            .next_back()
+            .rfind(|(_, l)| l.is_selectable())
             .map(|(i, _)| i)
     }
 }
@@ -198,12 +197,12 @@ pub fn layout_full(
 ) -> Vec<Line> {
     // The reading width never exceeds the window. A configured maximum below
     // the window width is intentional, so it is not raised.
-    let width = available_width.min(options.max_width).max(8);
+    let width = available_width.min(options.max_width).max(1);
     let mut lines: Vec<Line> = Vec::new();
 
     for (index, block) in chapter.blocks.iter().enumerate() {
         let indent = indent_for(&block.kind);
-        let usable = width.saturating_sub(indent).max(8);
+        let usable = width.saturating_sub(indent).max(1);
 
         if needs_leading_blank(&block.kind, lines.last().map(|l| l.kind)) {
             lines.push(Line::blank(index));
@@ -298,7 +297,7 @@ fn wrap_code(block: usize, source: &Block, usable: u16, indent: u16, out: &mut V
         } else {
             usable.saturating_sub(CONTINUATION.chars().count() as u16)
         }
-        .max(8);
+        .max(1);
         let end = break_at(&chars, at, budget);
         let mut pieces = Vec::new();
         if !first {
@@ -343,7 +342,9 @@ fn list_marker(kind: &BlockKind) -> Option<String> {
     }
 }
 
-/// Headings get room above them, other blocks a single blank line.
+/// A blank line before every block but the first, with two exceptions: list
+/// items run together after body text, and the lines of one code block stay
+/// together.
 fn needs_leading_blank(kind: &BlockKind, previous: Option<LineKind>) -> bool {
     let Some(previous) = previous else {
         return false;
@@ -413,18 +414,17 @@ fn wrap_block(
     // A list marker shortens every line: the first carries it, the rest are
     // indented by its width so the text stays aligned.
     let marker_width = marker.as_ref().map(|m| display_width(m)).unwrap_or(0) as u16;
-    let budget = usable.saturating_sub(marker_width).max(4);
+    let budget = usable.saturating_sub(marker_width).max(1);
     let mut first = true;
     let mut at = 0usize;
 
     while at < chars.len() {
         let end = break_at(&chars, at, budget);
         let mut pieces = Vec::new();
-        if first {
-            if let Some(marker) = &marker {
+        if first
+            && let Some(marker) = &marker {
                 pieces.push(Piece::decoration(marker.clone()));
             }
-        }
         pieces.extend(styles.pieces(&chars, at, end));
 
         out.push(Line {

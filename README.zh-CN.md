@@ -68,17 +68,19 @@ omaread                # 打开书库
 | 命令 | |
 | --- | --- |
 | `omaread` | 读书库 |
-| `omaread BOOK [--chapter N] [--at TEXT]` | 读一本书，并可定位 |
+| `omaread BOOK [--chapter N\|HREF] [--at TEXT]` | 读一本书，并可定位 |
 | `omaread list [--json] [--filter TEXT]` | 以表格列出书库 |
-| `omaread scan DIR [--filenames]` | 收录新书，识别移动过的书 |
+| `omaread scan DIR [--filenames]` | 收录某个目录下的书，并识别移动过的书 |
 | `omaread show BOOK [--json]` | 书自称的信息 |
-| `omaread set BOOK field=value …` | 更正信息，不改动文件 |
-| `omaread forget BOOK` | 移出一本书（或整个目录）|
-| `omaread find TEXT` | 全库搜索并打开命中的位置 |
+| `omaread set BOOK field=value …` | 更正书自称的信息，不改动文件 |
+| `omaread forget BOOK` | 移出一本书，或整个书架 |
+| `omaread find TEXT` | 全库搜索并阅读命中的位置 |
 | `omaread export [DIR] [--force] [--reindex] [--embed]` | 导出 Markdown，每章一个文件 |
-| `omaread inspect BOOK` | 脊与各章大小 |
-| `omaread images BOOK` | 图片及其自身像素尺寸 |
-| `omaread blocks N BOOK` | 某一章解析出的块 |
+| `omaread inspect BOOK` | 书文件里有什么，不经过书库 |
+| `omaread images BOOK` | 书文件中的图片，以及各自多大 |
+| `omaread blocks N BOOK` | 书文件某一章解析出的块 |
+| `omaread help [COMMAND]` | 同样的总览，或某条命令自己的帮助 |
+| `omaread --version` | 版本 |
 
 `set` 支持的字段：`title`、`authors`、`series`、`series-index`、`tags`、
 `rating`、`publisher`、`year`、`language`。值为空表示清除该字段。更正会作为
@@ -93,14 +95,15 @@ omaread                # 打开书库
 设置位于 `~/.config/omaread/config.toml`，首次启动时生成并带注释：
 
 ```toml
-# 日志目录；指向同步文件夹即可在多台机器间带着阅读进度走。
-# 每台机器只写自己的文件，不会冲突。
+# 日志目录，是阅读进度的唯一事实来源；指向同步文件夹即可在多台机器间
+# 带着阅读进度走。每台机器只写自己的文件，不会冲突。
 # journal_dir = "~/Dropbox/omaread/journal"
 
 # 阅读宽度（列）；注释掉则用整个窗口。
 # max_width = 66
 
-# 图片后端：kitty、sixel 或 half-blocks；注释掉则询问终端。
+# 图片如何绘制。注释掉则询问终端，在 kitty、sixel、half-blocks 中
+# 选最好的。在 tmux 里只有 half-blocks 可用，因为 tmux 自己管理屏幕。
 # images = "sixel"
 ```
 
