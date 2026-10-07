@@ -29,9 +29,11 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # The reader ships as one binary, and a smaller one is a smaller download and
 # less to page in. Symbol names are no use on a machine that is not going to
-# debug it, and LTO folds the duplicated generic instantiations the image
-# decoders produce.
+# debug it, LTO folds the duplicated generic instantiations the image decoders
+# produce, and nothing unwinds: a panic is a crash either way, and unwinding
+# tables cost about 8% of the file for a path no one takes.
 [profile.release]
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+panic = "abort"
