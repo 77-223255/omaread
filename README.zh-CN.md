@@ -116,9 +116,9 @@ omaread edit "Haruki Murakami" 'authors=["村上春树"]' --json
 设置位于 `~/.config/omaread/config.toml`，首次启动时生成并带注释：
 
 ```toml
-# 日志目录，是阅读进度的唯一事实来源；指向同步文件夹即可在多台机器间
-# 带着阅读进度走。每台机器只写自己的文件，不会冲突。
-# journal_dir = "~/Dropbox/omaread/journal"
+# 日志目录：一个本地文件，是阅读进度的唯一事实来源。它会在原地折叠，
+# 所以不打算在机器之间共享。
+# journal_dir = "~/.local/share/omaread/journal"
 
 # 阅读宽度（列）；注释掉则用整个窗口。
 # max_width = 66

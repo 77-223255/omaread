@@ -544,6 +544,32 @@ fn draw_contents(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, panel, &mut state);
 }
 
+/// One row of a key list: the keys, then what they do.
+fn binding_line(keys: &str, what: &str, theme: &crate::theme::Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {keys:<20}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(what.to_string(), Style::default().fg(rgb(theme.muted))),
+    ])
+}
+
+/// Draws a key list in the panel both help screens share.
+fn help_panel(frame: &mut Frame, area: Rect, width: u16, lines: Vec<Line<'static>>, theme: &crate::theme::Theme) {
+    let panel = centred(area, width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(i18n::t(" Keys - any key closes "))
+                .border_style(Style::default().fg(rgb(theme.muted))),
+        ),
+        panel,
+    );
+}
+
 /// Draws the key bindings, grouped as they are declared.
 fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme();
@@ -559,27 +585,12 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )));
         for (keys, what) in bindings {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {keys:<20}"),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(what, Style::default().fg(rgb(theme.muted))),
-            ]));
+            lines.push(binding_line(keys, what, &theme));
         }
     }
-
-    let height = lines.len() as u16 + 2;
-    let panel = centred(area, 66, height);
-    let paragraph = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(i18n::t(" Keys - any key closes "))
-            .border_style(Style::default().fg(rgb(theme.muted))),
-    );
-    frame.render_widget(Clear, panel);
-    frame.render_widget(paragraph, panel);
+    help_panel(frame, area, 66, lines, &theme);
 }
+
 
 fn shorten(text: &str, width: usize) -> String {
     let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -617,7 +628,7 @@ fn cut(text: &str, width: usize) -> String {
 
 /// The text cut to fit a number of cells, with a mark where it was cut. Text
 /// that already fits is handed back untouched.
-fn fit(text: &str, width: usize) -> String {
+pub(crate) fn fit(text: &str, width: usize) -> String {
     if cells(text) <= width {
         text.to_string()
     } else {
@@ -786,31 +797,15 @@ fn draw_shelf_status(
 
 fn draw_shelf_help(frame: &mut Frame, area: Rect, theme: &crate::theme::Theme) {
     let mut lines = vec![Line::from(Span::styled(
-        i18n::t("Library"),
+        i18n::t("Library").to_string(),
         Style::default()
             .fg(rgb(theme.accent))
             .add_modifier(Modifier::BOLD),
     ))];
     for (keys, what) in crate::shelf::Shelf::bindings() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {keys:<20}"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(what, Style::default().fg(rgb(theme.muted))),
-        ]));
+        lines.push(binding_line(keys, what, theme));
     }
-    let panel = centred(area, 62, lines.len() as u16 + 2);
-    frame.render_widget(Clear, panel);
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(i18n::t(" Keys - any key closes "))
-                .border_style(Style::default().fg(rgb(theme.muted))),
-        ),
-        panel,
-    );
+    help_panel(frame, area, 62, lines, theme);
 }
 
 /// The status line when no message is waiting: how many books are shown, out
@@ -835,7 +830,7 @@ fn shelf_summary(shown: usize, total: usize, filter: &str) -> String {
 }
 
 /// Cuts or pads a value to a fixed width, so the columns line up.
-fn pad(text: &str, width: usize) -> String {
+pub(crate) fn pad(text: &str, width: usize) -> String {
     let used = cells(text);
     if used > width {
         return cut(text, width);

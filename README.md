@@ -125,10 +125,9 @@ first start:
 ```toml
 # omaread settings
 
-# Where the journal lives. It is the source of truth for reading
-# positions. Point this at a synchronised folder to
-# carry your reading position between machines. Each machine writes
-# only its own file, so no conflict can arise.
+# Where the journal lives: one local file, the source of truth for
+# reading positions. It is folded in place as it grows, so it is not
+# meant to be shared between machines.
 # journal_dir = "~/.local/share/omaread/journal"
 
 # Reading width in columns. Comment out to use the full window.

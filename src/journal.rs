@@ -371,10 +371,10 @@ pub struct Journal {
     last_written: Option<Locator>,
 }
 
-/// A log that has grown past this is folded to the events that still matter when
-/// it is next opened for writing. The fold keeps exactly the state the log held
-/// (see `plan`), so it is housekeeping rather than a decision the reader has to
-/// make; a log small enough to read at a glance is left alone.
+/// A log that has grown this much new material since its last fold is folded
+/// again when it is next opened for writing. Measured against the size the last
+/// fold left, not against zero: a library whose folded state is itself larger
+/// than this would otherwise fold on every open, over bytes it cannot shed.
 const COMPACT_AFTER_BYTES: u64 = 256 * 1024;
 
 impl Journal {
@@ -402,7 +402,10 @@ impl Journal {
         // the single local file. A log that has grown long is folded too, and a
         // fold failure is not fatal: the log still replays as it is.
         let grown = std::fs::metadata(&own_file).map(|m| m.len()).unwrap_or(0);
-        if (!own_file.exists() && has_journal(dir)) || grown > COMPACT_AFTER_BYTES {
+        let folded = folded_bytes(dir);
+        if (!own_file.exists() && has_journal(dir))
+            || grown >= folded.saturating_add(COMPACT_AFTER_BYTES)
+        {
             let _ = compact(dir);
         }
         Ok(Self {
@@ -549,6 +552,14 @@ pub struct Compact {
     pub after: usize,
 }
 
+/// The size the log was left at by the last fold, or zero if it never was.
+fn folded_bytes(dir: &Path) -> u64 {
+    std::fs::read_to_string(dir.join(".folded"))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// Whether the folder holds any journal at all, under whatever name.
 fn has_journal(dir: &Path) -> bool {
     std::fs::read_dir(dir)
@@ -662,6 +673,10 @@ pub fn compact(dir: &Path) -> Result<Compact> {
         file.sync_all()?;
     }
     std::fs::rename(&tmp, &own).with_context(|| format!("cannot replace {}", own.display()))?;
+    // Remember how big the log is now, so the next fold waits for this much new
+    // material rather than folding again the moment it opens.
+    let folded = std::fs::metadata(&own).map(|m| m.len()).unwrap_or(0);
+    let _ = std::fs::write(dir.join(".folded"), folded.to_string());
 
     // The older per-machine files are folded in; only the one file is read from
     // here on.
@@ -1217,6 +1232,14 @@ mod tests {
         // Only one position for A is left in the file.
         let raw = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
         assert_eq!(raw.matches("position_set").count(), 1);
+        // The fold records the size it left, so the next one waits for 256 KB of
+        // new events instead of folding again the moment the log is opened.
+        let folded: u64 = std::fs::read_to_string(dir.join(".folded"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(folded, std::fs::metadata(dir.join("journal.jsonl")).unwrap().len());
         std::fs::remove_dir_all(&dir).ok();
     }
 

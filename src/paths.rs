@@ -79,7 +79,7 @@ impl Config {
 
     pub fn journal_dir(&self) -> Result<PathBuf> {
         match &self.journal_dir {
-            Some(dir) => Ok(expand_tilde(dir)),
+            Some(dir) => Ok(PathBuf::from(expand_tilde(&dir.to_string_lossy()))),
             None => Ok(data_dir()?.join("journal")),
         }
     }
@@ -149,15 +149,20 @@ pub fn data_dir() -> Result<PathBuf> {
         .context("cannot determine the data directory")
 }
 
-/// Replaces a leading `~` with the home directory.
-fn expand_tilde(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    match text.strip_prefix("~/") {
-        Some(rest) => match dirs::home_dir() {
-            Some(home) => home.join(rest),
-            None => path.to_path_buf(),
+/// Replaces a leading `~` with the home directory. A bare `~` is the home
+/// directory too: without this it is not a path at all, and falls through to the
+/// library to match whichever book happens to have a `~` in its title.
+pub fn expand_tilde(path: &str) -> String {
+    let rest = match path {
+        "~" => "",
+        other => match other.strip_prefix("~/") {
+            Some(rest) => rest,
+            None => return other.to_string(),
         },
-        None => path.to_path_buf(),
+    };
+    match dirs::home_dir() {
+        Some(home) => home.join(rest).to_string_lossy().into_owned(),
+        None => path.to_string(),
     }
 }
 
