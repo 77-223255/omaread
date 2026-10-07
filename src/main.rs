@@ -141,6 +141,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// The event log: what it holds, and how much of it still matters
+    Journal {
+        #[command(subcommand)]
+        command: JournalCommand,
+    },
     /// Write the library as Markdown, one file per chapter
     Export {
         /// Where to write them; left out, the data directory's export folder
@@ -177,6 +182,23 @@ enum Command {
         /// A book file, or a book the library knows by id or name
         #[arg(value_name = "BOOK")]
         file: String,
+    },
+}
+
+/// What `omaread journal` was asked to do with the log.
+#[derive(Subcommand)]
+enum JournalCommand {
+    /// What the log holds and how big it is
+    Status {
+        /// Print JSON rather than a table, for a program
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fold this machine's log to the events that still matter
+    Compact {
+        /// Print JSON rather than a line of prose, for a program
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -314,6 +336,14 @@ fn main() -> Result<()> {
             Command::Forget { what, json } => {
                 let config = paths::Config::load()?;
                 forget(what, &config.journal_dir()?, *json)
+            }
+            Command::Journal { command } => {
+                let config = paths::Config::load()?;
+                let dir = config.journal_dir()?;
+                match command {
+                    JournalCommand::Status { json } => journal_status(&dir, *json),
+                    JournalCommand::Compact { json } => journal_compact(&dir, *json),
+                }
             }
             Command::Export {
                 dir,
@@ -757,6 +787,45 @@ fn show_unseen_file(path: &Path, id: &BookId, json: bool) -> Result<()> {
     );
     line("file:", path.display().to_string());
     line("id:", id.to_string());
+    Ok(())
+}
+
+/// Shows how big the log is and how much of it still matters.
+fn journal_status(dir: &Path, json: bool) -> Result<()> {
+    let status = journal::status(dir)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+    for file in &status.files {
+        println!(
+            "{:<32} {:>7} events  {:>9} bytes",
+            file.name, file.events, file.bytes
+        );
+    }
+    println!(
+        "{} events in {} files, {} bytes; {} no longer matter",
+        status.events,
+        status.files.len(),
+        status.bytes,
+        status.dead
+    );
+    Ok(())
+}
+
+/// Folds this machine's log, and says how much it lost.
+fn journal_compact(dir: &Path, json: bool) -> Result<()> {
+    let compact = journal::compact(dir)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&compact)?);
+        return Ok(());
+    }
+    println!(
+        "folded {} events to {} ({} dropped)",
+        compact.before,
+        compact.after,
+        compact.before - compact.after
+    );
     Ok(())
 }
 

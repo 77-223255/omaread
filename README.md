@@ -78,6 +78,8 @@ author the library knows, or a file on disk.
 | `omaread set BOOK field=value … [--json]` | correct one book, without touching the file |
 | `omaread edit TEXT field=value … [--json]` | correct every book a word picks out, in one call |
 | `omaread forget BOOK [--json]` | take a book, or a whole shelf, out of the library |
+| `omaread journal status [--json]` | what the event log holds, and how much of it still matters |
+| `omaread journal compact [--json]` | fold this machine's log to the events that still matter |
 | `omaread find TEXT` | search the whole library and read the hit |
 | `omaread export [DIR] [--force] [--reindex] [--embed]` | write the library as Markdown, one file per chapter |
 | `omaread inspect BOOK` | what a book file holds, without the library |
@@ -142,6 +144,32 @@ The journal is the source of truth: an append-only JSONL log, one line per
 event, at `~/.local/share/omaread/journal/journal-<host>.jsonl`. Everything
 else is folded out of it on start. Because a book is recognised by the hash of
 its contents, moving or renaming it keeps its metadata and reading position.
+
+### The log cleans up after itself
+
+A log like this only grows, so it is folded now and then. Two things can no
+longer affect the library, and the fold drops exactly those:
+
+- everything before a book's last `book_forgotten` — the book was taken out and
+  read in again, so its first life is dead;
+- every reading position but the newest for a book, because a position is
+  last-writer-wins.
+
+Nothing else goes, so the library rebuilt from the folded log is the same
+one — byte for byte. The fold runs by itself when a machine's own log passes
+256 KB, and `omaread journal status` says how much of it still matters:
+
+```bash
+omaread journal status            # every file, and how much is dead weight
+omaread journal compact           # fold this machine's log now
+omaread journal status --json     # the same, for a program
+```
+
+Only this machine's own file is rewritten. A `journal-<otherhost>.jsonl` synced
+in from elsewhere belongs to another machine that may be writing to it right
+now, so it is read and left as it is; its own machine folds it. Because a fold
+preserves the file's contribution to the whole, an old copy of a folded file
+that a sync tool brings back still merges to the same library.
 
 ## Notes
 

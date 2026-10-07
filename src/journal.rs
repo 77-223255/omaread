@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,9 +367,17 @@ fn non_empty(value: String) -> Option<String> {
 pub struct Journal {
     /// This machine's file, named after this machine. The only one written to.
     own_file: PathBuf,
+    /// Guards a write against a compaction running at the same time.
+    lock_file: PathBuf,
     /// The last position written, to avoid recording every keystroke.
     last_written: Option<Locator>,
 }
+
+/// A log that has grown past this is folded to the events that still matter when
+/// it is next opened for writing. The fold keeps exactly the state the log held
+/// (see `plan`), so it is housekeeping rather than a decision the reader has to
+/// make; a log small enough to read at a glance is left alone.
+const COMPACT_AFTER_BYTES: u64 = 256 * 1024;
 
 impl Journal {
     /// Opens the journal directory, creating it when missing.
@@ -391,8 +400,15 @@ impl Journal {
         }
         let host = crate::paths::hostname();
         let own_file = dir.join(format!("journal-{host}.jsonl"));
+        // A log that has grown long is folded before it is written to again. A
+        // compaction failure is not fatal: the log still replays as it is.
+        let grown = std::fs::metadata(&own_file).map(|m| m.len()).unwrap_or(0);
+        if grown > COMPACT_AFTER_BYTES {
+            let _ = compact(dir);
+        }
         Ok(Self {
             own_file,
+            lock_file: dir.join(".lock"),
             last_written: None,
         })
     }
@@ -449,6 +465,10 @@ impl Journal {
             payload,
         };
         let line = serde_json::to_string(&event)?;
+        // Hold the lock across the open and the write, so a compaction cannot
+        // rename the file out from under it and leave the event in an inode
+        // nothing reads again.
+        let _lock = Lock::exclusive(&self.lock_file)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -490,6 +510,222 @@ impl Journal {
         self.last_written = Some(locator.clone());
         Ok(())
     }
+}
+
+/// An exclusive lock on the journal directory, held for the length of a write or
+/// a compaction.
+///
+/// `flock` on a file of its own rather than on the journal: compaction replaces
+/// the journal by rename, and a lock attached to the old file would not stop a
+/// write that had already opened the path and was waiting.
+struct Lock(File);
+
+impl Lock {
+    fn exclusive(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if locked != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("cannot lock {}", path.display()));
+        }
+        Ok(Lock(file))
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// What a compaction did.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Compact {
+    pub before: usize,
+    pub after: usize,
+}
+
+/// Which lines a compaction would keep.
+///
+/// Two rules, both consequences of how the log is folded, so dropping the rest
+/// cannot change the state:
+///
+/// - A `book_forgotten` wipes the book, so every event before this file's last
+///   one for that book is dead.
+/// - A reading position is last-writer-wins, so only the newest one per book is
+///   ever read.
+///
+/// Nothing else is dropped. A `book_seen` or a `metadata_set` can matter through
+/// another file — a path added here, a field another file's later event reads —
+/// so it is kept even when it looks redundant. A line that does not parse is
+/// kept too: throwing away what it does not understand is not this function's
+/// job.
+fn plan(lines: &[String]) -> Vec<bool> {
+    let events: Vec<Option<Event>> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let mut last_forget: HashMap<&str, usize> = HashMap::new();
+    let mut last_position: HashMap<&str, usize> = HashMap::new();
+    for (index, event) in events.iter().enumerate() {
+        let Some(event) = event else { continue };
+        if !event.is_plausible() {
+            continue;
+        }
+        match &event.payload {
+            Payload::BookForgotten => {
+                last_forget.insert(event.book.as_str(), index);
+            }
+            Payload::PositionSet { .. } => {
+                last_position.insert(event.book.as_str(), index);
+            }
+            _ => {}
+        }
+    }
+
+    let mut keep = vec![true; lines.len()];
+    for (index, event) in events.iter().enumerate() {
+        let Some(event) = event else { continue };
+        if !event.is_plausible() {
+            continue;
+        }
+        let book = event.book.as_str();
+        if last_forget.get(book).is_some_and(|forget| index < *forget) {
+            keep[index] = false;
+            continue;
+        }
+        if matches!(event.payload, Payload::PositionSet { .. })
+            && last_position.get(book).copied() != Some(index)
+        {
+            keep[index] = false;
+        }
+    }
+    keep
+}
+
+/// Folds this machine's journal to the events that still matter.
+///
+/// Only this machine's own file is rewritten. Every other journal in the folder
+/// belongs to another machine and is left alone, because this checkout cannot
+/// know whether that machine is still writing to it. The rewrite preserves this
+/// file's contribution to the fold (see `plan`), so the library rebuilt from the
+/// folder is the same one, and a synced copy of the old file merges the same way.
+pub fn compact(dir: &Path) -> Result<Compact> {
+    let own = dir.join(format!("journal-{}.jsonl", crate::paths::hostname()));
+    let _lock = Lock::exclusive(&dir.join(".lock"))?;
+    let raw = match std::fs::read_to_string(&own) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Compact::default()),
+        Err(err) => return Err(err).with_context(|| format!("cannot read {}", own.display())),
+    };
+    let lines: Vec<String> = raw.lines().map(str::to_string).collect();
+    let keep = plan(&lines);
+    let after = keep.iter().filter(|kept| **kept).count();
+    if after == lines.len() {
+        return Ok(Compact {
+            before: lines.len(),
+            after,
+        });
+    }
+
+    let mut kept = String::with_capacity(raw.len());
+    for (line, keep) in lines.iter().zip(&keep) {
+        if *keep {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    // Write beside the journal and rename over it: a reader sees the old file or
+    // the new one, never a half-written log. The temp name does not end in
+    // `.jsonl`, so a crash that leaves it behind is ignored by `replay`.
+    let tmp = own.with_extension("tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        file.write_all(kept.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, &own).with_context(|| format!("cannot replace {}", own.display()))?;
+    Ok(Compact {
+        before: lines.len(),
+        after,
+    })
+}
+
+/// What the journal folder holds, for `omaread journal status`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Status {
+    pub files: Vec<FileStatus>,
+    pub events: usize,
+    pub bytes: u64,
+    /// Lines that no longer matter, across every file. Only this machine's own
+    /// file can be rewritten, but the count says how much of the whole folder is
+    /// history rather than state.
+    pub dead: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileStatus {
+    pub name: String,
+    pub events: usize,
+    pub bytes: u64,
+    pub newest: Option<DateTime<Utc>>,
+}
+
+/// Reads every journal in the folder and says how big it is and how much of it
+/// still matters.
+pub fn status(dir: &Path) -> Result<Status> {
+    let mut status = Status {
+        files: Vec::new(),
+        events: 0,
+        bytes: 0,
+        dead: 0,
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(status),
+        Err(err) => return Err(err).with_context(|| format!("cannot read {}", dir.display())),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let lines: Vec<String> = raw.lines().map(str::to_string).collect();
+        let kept = plan(&lines).iter().filter(|kept| **kept).count();
+        let newest = lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .map(|event| event.at)
+            .max();
+        status.dead += lines.len() - kept;
+        status.events += lines.len();
+        status.bytes += raw.len() as u64;
+        status.files.push(FileStatus {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            events: lines.len(),
+            bytes: raw.len() as u64,
+            newest,
+        });
+    }
+    Ok(status)
 }
 
 #[cfg(test)]
@@ -836,6 +1072,150 @@ mod tests {
             std::fs::metadata(&synced).unwrap().permissions().mode() & 0o777,
             0o600,
             "another machine's journal stays readable to all"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `metadata_set` changing just the title.
+    fn meta(title: &str) -> Payload {
+        Payload::MetadataSet {
+            title: Some(title.to_string()),
+            authors: None,
+            series: None,
+            series_index: None,
+            tags: None,
+            rating: None,
+            publisher: None,
+            year: None,
+            language: None,
+        }
+    }
+
+    /// Writes events straight to this machine's file with increasing timestamps
+    /// and returns the directory. `append`'s wall clock is not ordered enough to
+    /// say which event came first.
+    fn journal_of(name: &str, events: &[(&BookId, Payload)]) -> PathBuf {
+        let dir = scratch(name);
+        Journal::open(&dir).unwrap();
+        let own = dir.join(format!("journal-{}.jsonl", crate::paths::hostname()));
+        let mut text = String::new();
+        let base = Utc::now();
+        for (index, (book, payload)) in events.iter().enumerate() {
+            let event = Event {
+                at: base + chrono::TimeDelta::seconds(index as i64),
+                book: book.as_str().to_string(),
+                payload: payload.clone(),
+            };
+            text.push_str(&serde_json::to_string(&event).unwrap());
+            text.push('\n');
+        }
+        std::fs::write(&own, text).unwrap();
+        dir
+    }
+
+    #[test]
+    fn compaction_keeps_the_state_and_drops_what_cannot_matter() {
+        let a = id(1);
+        let b = id(2);
+        let dir = journal_of(
+            "compact",
+            &[
+                // A was forgotten and read in again: its first life is dead.
+                (
+                    &a,
+                    Payload::BookSeen {
+                        title: Some("Old".into()),
+                        authors: vec!["X".into()],
+                        path: "/books/a.epub".into(),
+                    },
+                ),
+                (&a, meta("Corrected")),
+                (&a, Payload::BookForgotten),
+                (
+                    &a,
+                    Payload::BookSeen {
+                        title: Some("New".into()),
+                        authors: vec!["Y".into()],
+                        path: "/books/a.epub".into(),
+                    },
+                ),
+                (
+                    &a,
+                    Payload::PositionSet {
+                        href: "c1".into(),
+                        block: 1,
+                        offset: 0,
+                    },
+                ),
+                (
+                    &a,
+                    Payload::PositionSet {
+                        href: "c1".into(),
+                        block: 9,
+                        offset: 3,
+                    },
+                ),
+                // B was never forgotten: everything it did is kept.
+                (
+                    &b,
+                    Payload::BookSeen {
+                        title: Some("B".into()),
+                        authors: vec![],
+                        path: "/books/b.epub".into(),
+                    },
+                ),
+                (&b, meta("Bee")),
+            ],
+        );
+
+        let before = Journal::replay(&dir).unwrap();
+        let report = compact(&dir).unwrap();
+        let after = Journal::replay(&dir).unwrap();
+
+        assert_eq!(report.before, 8);
+        assert_eq!(report.after, 5, "A's first life and the older position go");
+        assert_eq!(before.books.len(), after.books.len());
+        for (id, record) in before.books.iter() {
+            let now = after.book(id).unwrap();
+            assert_eq!(now.title, record.title);
+            assert_eq!(now.authors, record.authors);
+            assert_eq!(now.paths, record.paths);
+        }
+        assert_eq!(before.position(&a), after.position(&a));
+        assert_eq!(before.position(&b), after.position(&b));
+        // Only one position for A is left in the file.
+        let raw = std::fs::read_to_string(
+            dir.join(format!("journal-{}.jsonl", crate::paths::hostname())),
+        )
+        .unwrap();
+        assert_eq!(raw.matches("position_set").count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_leaves_another_machines_journal_alone() {
+        let dir = scratch("compact-other");
+        Journal::open(&dir).unwrap();
+        let other = dir.join("journal-elsewhere.jsonl");
+        let a = id(3);
+        let event = Event {
+            at: Utc::now(),
+            book: a.as_str().to_string(),
+            payload: Payload::BookSeen {
+                title: Some("Elsewhere".into()),
+                authors: vec![],
+                path: "/books/e.epub".into(),
+            },
+        };
+        std::fs::write(&other, format!("{}\n", serde_json::to_string(&event).unwrap())).unwrap();
+        let original = std::fs::read_to_string(&other).unwrap();
+
+        compact(&dir).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            original,
+            "another machine's file was rewritten"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
