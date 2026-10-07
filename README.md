@@ -48,19 +48,31 @@ omaread                # open the library
 Move with `j`/`k` and open a book with `Enter`; it continues where you stopped.
 To read one file without adding it: `omaread ~/Downloads/book.epub`.
 
-Press `?` for the full key list. The ones worth knowing first:
+Press `?` for the full key list. Arrow keys move where `j`/`k` do; `←`/`→`
+switch chapters in the reading view and move the cursor by character in cursor
+mode, so the ones worth knowing first:
 
 | Key | |
 | --- | --- |
-| `j` `k` | line down / up |
-| `Space` `Backspace` | page down / up |
-| `L` `H` (`]` `[`) | next / previous chapter |
+| `j` `k` `↓` `↑` | line down / up |
+| `Space` `Backspace`, `PgDn` `PgUp` | page down / up |
+| `Ctrl-d` `Ctrl-u` | half a page |
+| `gg` `G` | start / end of the chapter |
+| `L` `H` (`]` `[`, `→` `←`) | next / previous chapter |
 | `t` `Tab` | table of contents |
 | `/`, `n` `N` | search the book, next / previous hit |
 | `i` | cursor in the text (links, movement) |
+| `h` `l` `←` `→` | move the cursor by character |
 | `Enter`, `Ctrl-o` | follow a link, come back |
+| `Esc` | step back: clear the search, leave the cursor, close the contents |
 | `q` | library |
 | `Q` | quit |
+| `?` | this key list |
+
+The library takes the same movement keys — `j`/`k` or `↓`/`↑`, `Space` and
+`PgDn` for a page — with `Enter` to open a book, `/` to filter, `s` to cycle
+the order and `Esc` to clear the filter. The mouse works too: a click opens a
+book in the library or a chapter in the contents, and the wheel scrolls.
 
 ## Commands
 

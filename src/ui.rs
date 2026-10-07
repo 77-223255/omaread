@@ -525,7 +525,7 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-fn draw_contents(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_contents(frame: &mut Frame, area: Rect, app: &mut App) {
     let entries = app.contents();
     let panel = centred(area, 60, entries.len() as u16 + 2);
     let items: Vec<ListItem> = entries.into_iter().map(ListItem::new).collect();
@@ -542,6 +542,15 @@ fn draw_contents(frame: &mut Frame, area: Rect, app: &App) {
     state.select(Some(app.contents_cursor()));
     frame.render_widget(Clear, panel);
     frame.render_stateful_widget(list, panel, &mut state);
+    // The list shifts itself to keep the cursor visible; the offset it settled
+    // on is what turns a later click's row back into a chapter.
+    app.set_contents_area(
+        panel.x,
+        panel.y,
+        panel.width,
+        panel.height,
+        state.offset(),
+    );
 }
 
 /// One row of a key list: the keys, then what they do.
@@ -664,6 +673,7 @@ pub fn draw_shelf(frame: &mut Frame, shelf: &mut crate::shelf::Shelf, theme: &cr
         height: list_area.height,
     };
     shelf.prepare(inner.height);
+    shelf.set_rows_area(inner.x, inner.y, inner.width, inner.height);
 
     let width = inner.width as usize;
     // The title keeps its room first, because it is what the eye looks for. The

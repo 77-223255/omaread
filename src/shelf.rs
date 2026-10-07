@@ -47,6 +47,9 @@ pub struct Shelf {
     /// Rows the list can show, set by the view before each draw.
     view_height: u16,
     scroll: usize,
+    /// Where the rows were drawn last, as `(x, y, width, height)`. Set by the
+    /// view so a click can be turned back into a row.
+    rows_area: (u16, u16, u16, u16),
 }
 
 impl Shelf {
@@ -69,6 +72,7 @@ impl Shelf {
             pending: None,
             view_height: 1,
             scroll: 0,
+            rows_area: (0, 0, 0, 0),
         }
     }
 
@@ -107,6 +111,52 @@ impl Shelf {
 
     pub fn total(&self) -> usize {
         self.all.len()
+    }
+
+    /// Tells the shelf where its rows were drawn, so a click can name one.
+    pub fn set_rows_area(&mut self, x: u16, y: u16, width: u16, height: u16) {
+        self.rows_area = (x, y, width, height);
+    }
+
+    /// Opens the book a click landed on, if it landed on one.
+    pub fn handle_click(&mut self, column: u16, row: u16) -> Action {
+        if self.mode != Mode::Browse {
+            return Action::None;
+        }
+        let (x, y, width, height) = self.rows_area;
+        if width == 0
+            || height == 0
+            || column < x
+            || column >= x + width
+            || row < y
+            || row >= y + height
+        {
+            return Action::None;
+        }
+        let index = self.scroll + (row - y) as usize;
+        if index >= self.shown.len() {
+            return Action::None;
+        }
+        self.cursor = index;
+        self.follow_cursor();
+        self.status = None;
+        self.open_selected()
+    }
+
+    /// Moves the cursor with the wheel, one book a notch.
+    pub fn handle_scroll(&mut self, up: bool) -> Action {
+        if self.mode != Mode::Browse {
+            return Action::None;
+        }
+        let last = self.shown.len().saturating_sub(1);
+        self.cursor = if up {
+            self.cursor.saturating_sub(1)
+        } else {
+            (self.cursor + 1).min(last)
+        };
+        self.status = None;
+        self.follow_cursor();
+        Action::None
     }
 
     /// Tells the shelf how many rows it has, before drawing.
@@ -256,7 +306,7 @@ impl Shelf {
     pub fn bindings() -> Vec<(&'static str, &'static str)> {
         let t = crate::i18n::t;
         vec![
-            ("j k", t("down, up")),
+            ("j k ↓ ↑", t("down, up")),
             ("Space Backspace", t("page down, up")),
             ("gg G", t("first, last")),
             ("Enter l", t("open the book")),
@@ -310,6 +360,7 @@ mod tests {
             pending: None,
             view_height: 10,
             scroll: 0,
+            rows_area: (0, 0, 0, 0),
         };
         shelf.apply();
         shelf
@@ -386,6 +437,57 @@ mod tests {
             }
             other => panic!("expected no action, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_click_opens_the_row_it_landed_on() {
+        let mut shelf = shelf_of(&["Anathem", "Cryptonomicon", "Seveneves"]);
+        shelf.set_rows_area(0, 2, 40, 3);
+        // The third row of the list, and the file behind it is gone, so the
+        // click reports rather than opens — but the cursor still moved there.
+        shelf.handle_click(3, 4);
+        assert_eq!(shelf.cursor(), 2);
+        // A click outside the rows leaves the cursor alone.
+        shelf.handle_click(3, 5);
+        assert_eq!(shelf.cursor(), 2);
+        // And clicking when the rows are not there yet does nothing.
+        let mut shelf = shelf_of(&["Anathem"]);
+        shelf.handle_click(0, 0);
+        assert_eq!(shelf.cursor(), 0);
+    }
+
+    #[test]
+    fn a_click_follows_the_scroll() {
+        let mut shelf = shelf_of(&["a", "b", "c", "d"]);
+        shelf.prepare(2);
+        shelf.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(shelf.scroll(), 2, "the last rows scrolled into view");
+        // The top row of the view is the third book, not the first.
+        shelf.set_rows_area(0, 0, 40, 2);
+        shelf.handle_click(0, 0);
+        assert_eq!(shelf.cursor(), 2);
+    }
+
+    #[test]
+    fn a_click_in_the_filter_prompt_is_not_a_book() {
+        let mut shelf = shelf_of(&["Anathem"]);
+        shelf.set_rows_area(0, 0, 40, 1);
+        shelf.handle_key(key(KeyCode::Char('/')));
+        shelf.handle_click(0, 0);
+        assert_eq!(shelf.mode, Mode::Filter, "the click did not open a book");
+    }
+
+    #[test]
+    fn the_wheel_moves_one_row_a_notch() {
+        let mut shelf = shelf_of(&["a", "b", "c", "d", "e"]);
+        shelf.handle_scroll(false);
+        assert_eq!(shelf.cursor(), 1);
+        shelf.handle_scroll(false);
+        assert_eq!(shelf.cursor(), 2);
+        shelf.handle_scroll(true);
+        assert_eq!(shelf.cursor(), 1);
+        shelf.handle_scroll(true);
+        assert_eq!(shelf.cursor(), 0, "must not go above the first");
     }
 
     #[test]

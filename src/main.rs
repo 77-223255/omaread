@@ -29,7 +29,7 @@ use epub::Book;
 use identity::BookId;
 use journal::{Journal, Payload, State};
 use layout::LayoutOptions;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEventKind};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -636,6 +636,7 @@ fn browse() -> Result<()> {
 
     let backend = choose_image_backend(config.images.as_deref())?;
     let mut terminal = ratatui::init();
+    let _mouse = MouseCapture::begin();
     let cell = cell_size();
     let mut theme = theme::Watcher::new();
 
@@ -662,6 +663,22 @@ fn browse() -> Result<()> {
                             shelf::Action::None => {}
                         }
                     }
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let shelf::Action::Open { id, path } =
+                                shelf.handle_click(mouse.column, mouse.row)
+                            {
+                                break Some((id, path));
+                            }
+                        }
+                        MouseEventKind::ScrollUp => {
+                            shelf.handle_scroll(true);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            shelf.handle_scroll(false);
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             };
@@ -730,6 +747,7 @@ fn find_and_open(query: &str) -> Result<()> {
     // Pick a hit, then open the book there.
     let backend = choose_image_backend(config.images.as_deref())?;
     let mut terminal = ratatui::init();
+    let _mouse = MouseCapture::begin();
     let cell = cell_size();
     let mut theme = theme::Watcher::new();
     let picked = pick_hit(&mut terminal, &results, &mut theme);
@@ -1267,6 +1285,7 @@ fn run_at(book: Book, path: PathBuf, chapter: Option<String>, at: Option<String>
     // be mistaken for user input later on.
     let backend = choose_image_backend(config.images.as_deref())?;
     let mut terminal = ratatui::init();
+    let _mouse = MouseCapture::begin();
     app.set_image_backend(backend, cell_size());
     let result = event_loop(&mut terminal, &mut app);
     ratatui::restore();
@@ -1274,6 +1293,33 @@ fn run_at(book: Book, path: PathBuf, chapter: Option<String>, at: Option<String>
     // Saving after restoring the terminal keeps an error message visible.
     app.save_position();
     result
+}
+
+/// Asks the terminal to report mouse presses for as long as this lives.
+///
+/// The cost is the terminal's own text selection: while mouse reporting is on,
+/// a drag is reported here rather than selected. The reader buys a list that
+/// can be clicked with it. A terminal that refuses costs only the mouse, so a
+/// failed enable is not worth failing the session over.
+struct MouseCapture;
+
+impl MouseCapture {
+    fn begin() -> Self {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::EnableMouseCapture
+        );
+        MouseCapture
+    }
+}
+
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::DisableMouseCapture
+        );
+    }
 }
 
 fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
@@ -1325,10 +1371,26 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                         Event::Key(next) if next.kind == KeyEventKind::Press => {
                             app.handle_key(next)
                         }
+                        Event::Mouse(mouse) => match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                app.handle_click(mouse.column, mouse.row)
+                            }
+                            MouseEventKind::ScrollUp => app.handle_scroll(true),
+                            MouseEventKind::ScrollDown => app.handle_scroll(false),
+                            _ => {}
+                        },
                         _ => {}
                     }
                 }
             }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    app.handle_click(mouse.column, mouse.row);
+                }
+                MouseEventKind::ScrollUp => app.handle_scroll(true),
+                MouseEventKind::ScrollDown => app.handle_scroll(false),
+                _ => {}
+            },
             _ => {}
         }
     }

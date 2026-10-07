@@ -117,6 +117,10 @@ pub struct App {
     pending_cursor: Option<(usize, usize)>,
     /// What has been typed into the search prompt so far.
     search_input: String,
+    /// Where the contents panel was drawn last, as `(x, y, width, height)`, and
+    /// the first entry it showed. Set by the view so a click can name a chapter.
+    contents_area: (u16, u16, u16, u16),
+    contents_offset: usize,
 }
 
 /// The name to show for a book.
@@ -199,6 +203,8 @@ impl App {
             jumps: Vec::new(),
             pending_cursor: None,
             search_input: String::new(),
+            contents_area: (0, 0, 0, 0),
+            contents_offset: 0,
         })
     }
 
@@ -687,8 +693,8 @@ impl App {
             KeyCode::Backspace | KeyCode::PageUp => self.scroll_by(-page),
             KeyCode::Char('g') => self.pending = Some('g'),
             KeyCode::Char('G') => self.scroll = self.max_scroll(),
-            KeyCode::Char('L') | KeyCode::Char(']') => self.next_chapter(),
-            KeyCode::Char('H') | KeyCode::Char('[') => self.previous_chapter(),
+            KeyCode::Char('L') | KeyCode::Char(']') | KeyCode::Right => self.next_chapter(),
+            KeyCode::Char('H') | KeyCode::Char('[') | KeyCode::Left => self.previous_chapter(),
             KeyCode::Char('t') | KeyCode::Tab => self.open_contents(),
             KeyCode::Char('o') if ctrl => self.jump_back(),
             // Entering normal mode puts a cursor into the text.
@@ -801,6 +807,40 @@ impl App {
                 self.mode = Mode::Reading;
             }
             _ => {}
+        }
+    }
+
+    /// Opens the chapter a click landed on, when the contents are shown.
+    pub fn handle_click(&mut self, column: u16, row: u16) {
+        if self.mode != Mode::Contents {
+            return;
+        }
+        let Some(index) = clicked_chapter(
+            self.contents_area,
+            self.contents_offset,
+            self.book.spine.len(),
+            column,
+            row,
+        ) else {
+            return;
+        };
+        self.contents_cursor = index;
+        self.go_to_chapter(index);
+        self.mode = Mode::Reading;
+    }
+
+    /// Scrolls the view with the wheel: one row a notch.
+    pub fn handle_scroll(&mut self, up: bool) {
+        let step: isize = if up { -1 } else { 1 };
+        match self.mode {
+            Mode::Reading => self.scroll_by(step),
+            Mode::Cursor => self.move_cursor_vertically(step),
+            Mode::Contents => {
+                let last = self.book.spine.len().saturating_sub(1);
+                let moved = self.contents_cursor as isize + step;
+                self.contents_cursor = moved.clamp(0, last as isize) as usize;
+            }
+            Mode::Help | Mode::Search => {}
         }
     }
 
@@ -1209,6 +1249,13 @@ impl App {
         self.mode = Mode::Contents;
     }
 
+    /// Tells the reader where the contents panel was drawn and how far it
+    /// scrolled, so a click can name a chapter.
+    pub fn set_contents_area(&mut self, x: u16, y: u16, width: u16, height: u16, offset: usize) {
+        self.contents_area = (x, y, width, height);
+        self.contents_offset = offset;
+    }
+
     fn next_chapter(&mut self) {
         if self.chapter_index + 1 < self.book.spine.len() {
             self.go_to_chapter(self.chapter_index + 1);
@@ -1268,12 +1315,12 @@ pub fn bindings() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
         (
             "Reading",
             vec![
-                ("j k", t("line down, up")),
+                ("j k ↓ ↑", t("line down, up")),
                 ("Space Backspace", t("page down, up")),
                 ("Ctrl-d Ctrl-u", t("half a page")),
                 ("gg G", t("start, end of chapter")),
-                ("L ]", t("next chapter")),
-                ("H [", t("previous chapter")),
+                ("L ] →", t("next chapter")),
+                ("H [ ←", t("previous chapter")),
                 ("t Tab", t("contents")),
                 ("/", t("search the book")),
                 ("n N", t("next, previous match")),
@@ -1286,8 +1333,8 @@ pub fn bindings() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
         (
             "Cursor",
             vec![
-                ("h l w b 0 $", t("move by character, word, to line edge")),
-                ("j k gg G", t("move by line, to chapter edges")),
+                ("h l ← → w b 0 $", t("move by character, word, to line edge")),
+                ("j k ↑ ↓ gg G", t("move by line, to chapter edges")),
                 ("Enter", t("follow the link under the cursor")),
                 ("Ctrl-o", t("back out of followed links")),
                 ("/ n N", t("search, next match, previous match")),
@@ -1297,12 +1344,41 @@ pub fn bindings() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
         (
             "Contents",
             vec![
-                ("j k gg G", t("move the cursor")),
+                ("j k ↑ ↓ gg G", t("move the cursor")),
                 ("Enter", t("open the chapter")),
                 ("q Esc", t("close")),
             ],
         ),
     ]
+}
+
+/// Turns a click inside the contents panel into a chapter index.
+///
+/// `area` is the panel as drawn, `(x, y, width, height)`; `offset` is the first
+/// entry it showed, which only the view knows because the list scrolled itself
+/// to keep the cursor visible; `count` is how many chapters there are. `None`
+/// means the click landed on the border, outside the panel, or past the last
+/// chapter.
+fn clicked_chapter(
+    area: (u16, u16, u16, u16),
+    offset: usize,
+    count: usize,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let (x, y, width, height) = area;
+    // Borders take the first and last column and row, so a panel narrower than
+    // three cells has no rows at all.
+    if width < 3 || height < 3 {
+        return None;
+    }
+    let (left, top) = (x + 1, y + 1);
+    let (right, bottom) = (x + width - 1, y + height - 1);
+    if column < left || column >= right || row < top || row >= bottom {
+        return None;
+    }
+    let index = offset + (row - top) as usize;
+    (index < count).then_some(index)
 }
 
 /// Splits a link target into its file part and its fragment.
@@ -1454,6 +1530,24 @@ mod tests {
         assert_eq!(previous_word_start(&chars, 9), Some(4));
         assert_eq!(previous_word_start(&chars, 4), Some(0));
         assert_eq!(previous_word_start(&chars, 0), None);
+    }
+
+    #[test]
+    fn a_click_on_the_contents_names_a_chapter() {
+        // A panel of six rows, its rows one cell in from the border.
+        let area = (10, 5, 40, 6);
+        assert_eq!(clicked_chapter(area, 0, 10, 11, 6), Some(0));
+        assert_eq!(clicked_chapter(area, 0, 10, 11, 9), Some(3));
+        // A scrolled list shifts the entries, not the rows they sit on.
+        assert_eq!(clicked_chapter(area, 7, 10, 11, 6), Some(7));
+        // The border, the space outside it, and the row under the last entry.
+        assert_eq!(clicked_chapter(area, 0, 10, 10, 6), None);
+        assert_eq!(clicked_chapter(area, 0, 10, 11, 5), None);
+        assert_eq!(clicked_chapter(area, 0, 10, 11, 10), None);
+        assert_eq!(clicked_chapter(area, 0, 10, 9, 6), None);
+        // A click past the last chapter names nothing.
+        assert_eq!(clicked_chapter(area, 3, 4, 11, 6), Some(3));
+        assert_eq!(clicked_chapter(area, 3, 4, 11, 7), None);
     }
 
     /// A book whose one drawable picture has a header that measures and bytes
