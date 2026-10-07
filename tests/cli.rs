@@ -502,19 +502,14 @@ fn the_xdg_variables_decide_where_every_file_goes() {
         "testtheme"
     );
 
-    // A scan writes the journal under XDG_DATA_HOME, one file per machine.
+    // A scan writes the journal under XDG_DATA_HOME, the single local log.
     let file = dir.join("books/one.epub");
     book(&file, "One", &["first chapter text"]);
     let out = omaread(&dir).args(["scan", "books"]).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     let journal = dir.join("data/omaread/journal");
-    let written: Vec<_> = std::fs::read_dir(&journal)
-        .expect("the journal follows XDG_DATA_HOME")
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("journal-"))
-        .collect();
     assert!(
-        !written.is_empty(),
+        journal.join("journal.jsonl").exists(),
         "no journal file under {}",
         journal.display()
     );

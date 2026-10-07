@@ -6,9 +6,9 @@
 //!   control.
 //! - `~/.local/share/omaread/` holds the read model, which is derived and may
 //!   be deleted at any time.
-//! - The journal directory holds the source of truth. It defaults to the data
-//!   directory and should be moved to a synchronised folder when the reading
-//!   position is meant to hold across machines.
+//! - The journal directory holds the source of truth. It is one local file,
+//!   rewritten in place when it is folded; it is not meant to be shared
+//!   between machines.
 //!
 //! Omarchy's theme files are answered from here too: the reader follows a
 //! theme Omarchy renders, and Omarchy keeps its own files by the same rules.
@@ -58,10 +58,9 @@ impl Config {
         let contents = format!(
             "# omaread settings\n\
              \n\
-             # Where the journal lives. It is the source of truth for reading\n\
-             # positions. Point this at a synchronised folder to\n\
-             # carry your reading position between machines. Each machine writes\n\
-             # only its own file, so no conflict can arise.\n\
+             # Where the journal lives: one local file, the source of truth for\n\
+             # reading positions. It is folded in place as it grows, so it is\n\
+             # not meant to be shared between machines.\n\
              # journal_dir = \"{}\"\n\
              \n\
              # Reading width in columns. Comment out to use the full window.\n\
@@ -162,49 +161,9 @@ fn expand_tilde(path: &Path) -> PathBuf {
     }
 }
 
-/// Name of this machine, used to name its journal file. Falls back to a fixed
-/// name so a missing hostname never loses events.
-pub fn hostname() -> String {
-    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
-        .unwrap_or_default();
-    filename_safe(&raw)
-}
-
-/// Turns a hostname into something a file name may hold: every character that
-/// is not a letter, a digit or a dash becomes an underscore, and a name with
-/// nothing left in it becomes a fixed one.
-fn filename_safe(raw: &str) -> String {
-    let name: String = raw
-        .trim()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if name.is_empty() {
-        "unknown-host".to_string()
-    } else {
-        name
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_hostname_becomes_a_name_a_file_can_hold() {
-        // Whatever the machine is called, the journal's name is a file name:
-        // a slash or a space must not become a directory or a second word.
-        assert_eq!(filename_safe("my host/name.v2\n"), "my_host_name_v2");
-        assert_eq!(filename_safe("box-1"), "box-1");
-        assert_eq!(filename_safe("   "), "unknown-host");
-    }
 
     #[test]
     fn settings_are_read_from_toml_and_absent_values_stay_default() {

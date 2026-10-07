@@ -77,7 +77,7 @@ omaread                # 打开书库
 | `omaread edit TEXT field=value … [--json]` | 一次更正某个词命中的每一本书 |
 | `omaread forget BOOK [--json]` | 移出一本书，或整个书架 |
 | `omaread journal status [--json]` | 事件日志里有什么，还有多少仍然有用 |
-| `omaread journal compact [--json]` | 把本机的日志折算成仍然有用的事件 |
+| `omaread journal compact [--json]` | 把日志折算成仍然有用的事件 |
 | `omaread find TEXT` | 全库搜索并阅读命中的位置 |
 | `omaread export [DIR] [--force] [--reindex] [--embed]` | 导出 Markdown，每章一个文件 |
 | `omaread inspect BOOK` | 书文件里有什么，不经过书库 |
@@ -128,31 +128,27 @@ omaread edit "Haruki Murakami" 'authors=["村上春树"]' --json
 # images = "sixel"
 ```
 
-日志是唯一事实来源：只追加的 JSONL，一行一个事件，位于
-`~/.local/share/omaread/journal/journal-<主机名>.jsonl`，启动时折算出其余状态。
+日志是唯一事实来源：一个本地 JSONL 日志，一行一个事件，位于
+`~/.local/share/omaread/journal/journal.jsonl`，启动时折算出其余状态。由于书按内容
+哈希识别，移动或改名都会保留元数据与阅读进度。
 
 ### 日志会自行清理
 
-这样的日志只会越长越大，所以会不定期折算一次。有两类事件再也影响不了书库，折算
-恰好只丢掉它们：
+这样的日志只会越长越大，所以会不定期折算一次。折算会把书库真正需要的事件写回去
+——每本书实际所在的每个文件一条 `book_seen`、一条 `metadata_set` 装下文件装不下的
+字段、一条 `position_set`——并丢掉它们背后的历史：标题是怎么更正的、书在移动前
+在哪里、一本被移出又重新读入的书。从折算后的日志重建的书库和原来**逐字节相同**。
 
-- 一本书最后一次 `book_forgotten` 之前的一切——书被移出又重新读入，它的“前世”
-  已经死了；
-- 一本书除最新一条之外的所有阅读位置，因为位置是按时间取最新。
-
-别的都不丢，所以从折算后的日志重建的书库和原来**逐字节相同**。当本机日志超过
-256 KB 时会自动折算一次；`omaread journal status` 会告诉你还有多少是死重量：
+日志超过 256 KB 时会自动折算；`omaread journal` 也能随时查看和触发：
 
 ```bash
-omaread journal status            # 每个文件，以及多少已经没用了
-omaread journal compact           # 立刻折算本机日志
+omaread journal status            # 日志里有什么，还有多少是死重量
+omaread journal compact           # 立刻折算
 omaread journal status --json     # 同样的内容，给程序读
 ```
 
-只会重写本机自己的那个文件。从别处同步过来的 `journal-<其它主机>.jsonl` 属于另一台
-机器，它可能正在写，所以只读不改，由它自己的机器去折算。因为折算保留了这个文件对
-整体的那份贡献，同步工具把一份旧的已折算文件带回来，合并出的书库仍然一样。
-由于书按内容哈希识别，移动或改名都会保留元数据与阅读进度。
+日志属于本机，不打算在机器之间共享。旧版本留下的、每台机器一个的
+`journal-<主机名>.jsonl` 会在下一次写入时被折进这一个文件，旧文件随之删除。
 
 ## 其他
 
