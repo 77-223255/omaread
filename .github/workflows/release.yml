@@ -1,4 +1,5 @@
-# Builds a downloadable binary whenever a version tag is pushed.
+# Builds a downloadable binary when someone asks for one: a version tag is a
+# name for a commit, not a request to build.
 #
 # The target is musl rather than glibc, so the result is statically linked and
 # runs on any x86_64 Linux regardless of how old its C library is. That matters
@@ -11,9 +12,7 @@
 name: release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
