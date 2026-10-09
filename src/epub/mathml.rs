@@ -31,7 +31,8 @@ pub fn script_text(node: Node, sub: bool) -> Option<String> {
     if node.children().any(|child| child.is_element()) {
         return None;
     }
-    let raw = collapse_whitespace(&collect_raw_text(node));
+    let collected = collect_raw_text(node);
+    let raw = collapse_whitespace(&collected);
     let text = raw.trim();
     if text.is_empty() {
         return None;
@@ -140,7 +141,10 @@ fn render_node(node: Node, out: &mut Out) {
     }
 
     let name = node.tag_name().name();
-    let kids = element_children(node);
+    // The list of element children is built only by the arms that read it. A
+    // token such as `<mi>` takes its text from its own subtree and never looks
+    // at the list, so building one for every node of every formula was a Vec
+    // bought for nothing.
     match name {
         // Grouping and styling elements carry no meaning of their own. The
         // book's `mathvariant` and `mathsize` are dropped: a run has no place
@@ -150,6 +154,7 @@ fn render_node(node: Node, out: &mut Out) {
         }
         // Only the presentation branch of an annotated expression is shown.
         "semantics" => {
+            let kids = element_children(node);
             if let Some(first) = kids.first() {
                 render_node(*first, out);
             }
@@ -159,10 +164,20 @@ fn render_node(node: Node, out: &mut Out) {
         "mphantom" | "mspace" => out.space(),
         "mi" | "mn" | "ms" | "mtext" => push_text(&collect_raw_text(node), out),
         "mo" => push_operator(&collect_raw_text(node), out),
-        "msub" | "munder" => push_scripted(&kids, Some(1), None, out),
-        "msup" | "mover" => push_scripted(&kids, None, Some(1), out),
-        "msubsup" | "munderover" => push_scripted(&kids, Some(1), Some(2), out),
+        "msub" | "munder" => {
+            let kids = element_children(node);
+            push_scripted(&kids, Some(1), None, out)
+        }
+        "msup" | "mover" => {
+            let kids = element_children(node);
+            push_scripted(&kids, None, Some(1), out)
+        }
+        "msubsup" | "munderover" => {
+            let kids = element_children(node);
+            push_scripted(&kids, Some(1), Some(2), out)
+        }
         "mfrac" => {
+            let kids = element_children(node);
             let numerator = kids.first().map(|n| render_alone(*n)).unwrap_or_default();
             let denominator = kids.get(1).map(|n| render_alone(*n)).unwrap_or_default();
             out.push(&format!("{}/{}", group(&numerator), group(&denominator)));
@@ -173,6 +188,7 @@ fn render_node(node: Node, out: &mut Out) {
             out.push(&format!("√{}", group(&inner.finish())));
         }
         "mroot" => {
+            let kids = element_children(node);
             let radicand = kids.first().map(|n| render_alone(*n)).unwrap_or_default();
             let degree = kids.get(1).map(|n| render_tight(*n)).unwrap_or_default();
             let mark = match to_superscript(&degree) {
@@ -184,6 +200,7 @@ fn render_node(node: Node, out: &mut Out) {
         // A table is the one construct that truly needs more than a line. Its
         // rows are separated by a semicolon, which at least keeps them apart.
         "mtable" => {
+            let kids = element_children(node);
             let rows: Vec<String> = kids
                 .iter()
                 .filter(|row| matches!(row.tag_name().name(), "mtr" | "mlabeledtr"))
@@ -482,7 +499,9 @@ mod tests {
     }
 
     #[test]
-    fn indices_use_unicode_where_there_is_one_and_plain_where_there_is_not() {
+    fn an_index_is_unicode_where_there_is_one_and_written_out_where_there_is_not() {
+        // Both ways a book sets an index: inside a formula, and in HTML
+        // markup outside one.
         assert_eq!(math("<math><msub><mi>R</mi><mi>s</mi></msub></math>"), "Rₛ");
         assert_eq!(
             math(
@@ -506,68 +525,8 @@ mod tests {
         // has no subscript of its own.
         let xml = "<math><munderover><mi>Π</mi><mrow><mi>I</mi><mo>=</mo><mn>1</mn></mrow>                   <mi>n</mi></munderover><msub><mi>R</mi><mi>i</mi></msub></math>";
         assert_eq!(math(xml), "Π_(I=1)^(n)Rᵢ");
-    }
 
-    #[test]
-    fn spacing_follows_the_symbol() {
-        // A relation is spaced, a sign is not, and a fence or a decimal point
-        // binds tight to what it is set against.
-        let xml = "<math><mi>a</mi><mo>=</mo><mo>−</mo><mi>b</mi></math>";
-        assert_eq!(math(xml), "a = −b");
-        let xml = "<math><mo>(</mo><mn>0</mn><mo>.</mo><mn>9</mn><mn>9</mn><mo>)</mo></math>";
-        assert_eq!(math(xml), "(0.99)");
-        // A comma binds to what stands before it.
-        let xml = "<math><msub><mi>P</mi><mn>1</mn></msub><mo>,</mo>\
-                   <mo>⋯</mo><mo>,</mo><msub><mi>P</mi><mi>m</mi></msub></math>";
-        assert_eq!(math(xml), "P₁, ⋯, Pₘ");
-        // And a space the markup asks for is a space, not a collapsed one.
-        let xml =
-            "<math><mtext>Coffee</mtext><mspace width=\"4.pt\"/><mtext>Drinker</mtext></math>";
-        assert_eq!(math(xml), "Coffee Drinker");
-    }
-
-    #[test]
-    fn a_two_dimensional_structure_comes_out_on_one_line() {
-        let simple =
-            "<math><mfrac bevelled=\"true\"><mn>5</mn><mrow><mn>16</mn></mrow></mfrac></math>";
-        assert_eq!(math(simple), "5/16");
-        let compound = "<math><mfrac><mtext>Uptime</mtext>\
-                        <mrow><mtext>Uptime</mtext><mo>+</mo><mtext>Downtime</mtext></mrow></mfrac></math>";
-        assert_eq!(math(compound), "Uptime/(Uptime + Downtime)");
-
-        assert_eq!(math("<math><msqrt><mn>2</mn></msqrt></math>"), "√2");
-        let sum = "<math><msqrt><mi>a</mi><mo>+</mo><mi>b</mi></msqrt></math>";
-        assert_eq!(math(sum), "√(a + b)");
-        let cube = "<math><mroot><mi>x</mi><mn>3</mn></mroot></math>";
-        assert_eq!(math(cube), "³√x");
-    }
-
-    #[test]
-    fn a_formula_comes_out_as_its_visible_characters_only() {
-        // The semantic annotation is a copy of the formula in another
-        // language, not part of it, and U+2062 (invisible times) marks
-        // structure without showing it.
-        let xml = "<math><semantics><mrow><mi>x</mi></mrow>\
-                   <annotation encoding=\"application/x-tex\">x</annotation></semantics></math>";
-        assert_eq!(math(xml), "x");
-        let xml = "<math><mi>a</mi><mo>\u{2062}</mo><mi>b</mi></math>";
-        assert_eq!(math(xml), "ab");
-
-        // O'Reilly titles set every element on its own line. Taking that as
-        // content would spell the logarithm `l o g`.
-        let xml = "<math>\n  <mi>l</mi>\n  <mi>o</mi>\n  <mi>g</mi>\n  <mn>2</mn>\n</math>";
-        assert_eq!(math(xml), "log2");
-    }
-
-    #[test]
-    fn the_rows_of_a_table_are_separated() {
-        let xml = "<math><mtable><mtr><mtd><mi>a</mi></mtd><mtd><mn>1</mn></mtd></mtr>\
-                   <mtr><mtd><mi>b</mi></mtd><mtd><mn>2</mn></mtd></mtr></mtable></math>";
-        assert_eq!(math(xml), "a 1; b 2");
-    }
-
-    #[test]
-    fn an_html_index_is_converted_unless_it_carries_markup() {
+        // The HTML markup outside a formula converts the same way…
         let doc = Document::parse("<sub>2</sub>").unwrap();
         assert_eq!(script_text(doc.root_element(), true).as_deref(), Some("₂"));
         let doc = Document::parse("<sup>3</sup>").unwrap();
@@ -591,5 +550,59 @@ mod tests {
         let xml = "<sup><a href=\"note.xhtml\">1</a></sup>";
         let doc = Document::parse(xml).unwrap();
         assert_eq!(script_text(doc.root_element(), false), None);
+    }
+
+    #[test]
+    fn spacing_follows_the_symbol() {
+        // A relation is spaced, a sign is not, and a fence or a decimal point
+        // binds tight to what it is set against.
+        let xml = "<math><mi>a</mi><mo>=</mo><mo>−</mo><mi>b</mi></math>";
+        assert_eq!(math(xml), "a = −b");
+        let xml = "<math><mo>(</mo><mn>0</mn><mo>.</mo><mn>9</mn><mn>9</mn><mo>)</mo></math>";
+        assert_eq!(math(xml), "(0.99)");
+        // A comma binds to what stands before it.
+        let xml = "<math><msub><mi>P</mi><mn>1</mn></msub><mo>,</mo>\
+                   <mo>⋯</mo><mo>,</mo><msub><mi>P</mi><mi>m</mi></msub></math>";
+        assert_eq!(math(xml), "P₁, ⋯, Pₘ");
+        // And a space the markup asks for is a space, not a collapsed one.
+        let xml =
+            "<math><mtext>Coffee</mtext><mspace width=\"4.pt\"/><mtext>Drinker</mtext></math>";
+        assert_eq!(math(xml), "Coffee Drinker");
+    }
+
+    #[test]
+    fn a_formula_comes_out_on_one_line_as_its_visible_characters() {
+        // Two-dimensional structure: the compound comes out in the order it
+        // reads…
+        let simple =
+            "<math><mfrac bevelled=\"true\"><mn>5</mn><mrow><mn>16</mn></mrow></mfrac></math>";
+        assert_eq!(math(simple), "5/16");
+        let compound = "<math><mfrac><mtext>Uptime</mtext>\
+                        <mrow><mtext>Uptime</mtext><mo>+</mo><mtext>Downtime</mtext></mrow></mfrac></math>";
+        assert_eq!(math(compound), "Uptime/(Uptime + Downtime)");
+        assert_eq!(math("<math><msqrt><mn>2</mn></msqrt></math>"), "√2");
+        let sum = "<math><msqrt><mi>a</mi><mo>+</mo><mi>b</mi></msqrt></math>";
+        assert_eq!(math(sum), "√(a + b)");
+        let cube = "<math><mroot><mi>x</mi><mn>3</mn></mroot></math>";
+        assert_eq!(math(cube), "³√x");
+
+        // …while anything the formula does not show goes: the semantic
+        // annotation is a copy in another language, and U+2062 (invisible
+        // times) marks structure without showing it.
+        let xml = "<math><semantics><mrow><mi>x</mi></mrow>\
+                   <annotation encoding=\"application/x-tex\">x</annotation></semantics></math>";
+        assert_eq!(math(xml), "x");
+        let xml = "<math><mi>a</mi><mo>\u{2062}</mo><mi>b</mi></math>";
+        assert_eq!(math(xml), "ab");
+
+        // O'Reilly titles set every element on its own line. Taking that as
+        // content would spell the logarithm `l o g`.
+        let xml = "<math>\n  <mi>l</mi>\n  <mi>o</mi>\n  <mi>g</mi>\n  <mn>2</mn>\n</math>";
+        assert_eq!(math(xml), "log2");
+
+        // And a table's rows are separated, not run together.
+        let xml = "<math><mtable><mtr><mtd><mi>a</mi></mtd><mtd><mn>1</mn></mtd></mtr>\
+                   <mtr><mtd><mi>b</mi></mtd><mtd><mn>2</mn></mtd></mtr></mtable></math>";
+        assert_eq!(math(xml), "a 1; b 2");
     }
 }

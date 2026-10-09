@@ -69,11 +69,7 @@ pub fn export(dir: &Path, state: &State, force: bool) -> Result<Report> {
 
         let count = book.spine.len();
         for index in 0..count {
-            let title = book
-                .spine
-                .get(index)
-                .and_then(|item| item.title.clone())
-                .unwrap_or_else(|| format!("Chapter {}", index + 1));
+            let title = book.chapter_title(index);
             let Ok(chapter) = book.chapter(index) else {
                 continue;
             };
@@ -305,6 +301,30 @@ pub fn origin_of(path: &Path) -> Result<Origin> {
     parse_origin(&text).with_context(|| format!("{} carries no book reference", path.display()))
 }
 
+/// The text of one line of an exported file, trimmed to something worth
+/// showing as the passage a hit landed on.
+///
+/// A whole line can be a long paragraph; the first words are enough to find
+/// the passage again and are less likely to differ from the book by a stray
+/// character. Front matter is bookkeeping rather than book text, and one
+/// word on a line is no passage — the search hands a hit back to the reader
+/// with it, and both callers want the same answer.
+pub fn line_text(path: &Path, line: usize) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let raw = text.lines().nth(line.saturating_sub(1))?.trim();
+    if raw.is_empty() || raw.starts_with("---") {
+        return None;
+    }
+    // Markdown decoration would not appear in the book's own text.
+    let cleaned = raw.trim_start_matches(['#', '>', '-', '*', ' ']).trim();
+    let words: Vec<&str> = cleaned.split_whitespace().take(8).collect();
+    if words.len() < 2 {
+        None
+    } else {
+        Some(words.join(" "))
+    }
+}
+
 fn parse_origin(text: &str) -> Option<Origin> {
     let body = text.strip_prefix("---")?;
     let end = body.find("\n---")?;
@@ -361,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn one_title_line_names_book_and_chapter() {
+    fn one_title_line_names_book_and_chapter_and_books_headings_keep_their_levels() {
         // Exactly one first-level heading: the title, whether the chapter
         // opens with a heading of its own or with nothing but prose. The
         // book's own headings sit below it.
@@ -391,12 +411,10 @@ mod tests {
             Some("1. Beginning"),
         );
         assert!(md.starts_with("# A Book · 1. Beginning"), "{md}");
-    }
 
-    #[test]
-    fn the_books_own_headings_keep_their_levels() {
-        // Without a title to add, nothing is shifted: the book's own first
-        // heading stays where the book put it.
+        // And without a title to add, nothing is shifted: the book's own
+        // first heading stays where the book put it, and the levels under it
+        // are the levels the book gave them.
         let md = chapter_markdown(&chapter(vec![block(BlockKind::Heading(1), "Title")]));
         assert!(md.contains("# Title"));
         assert!(!md.contains("## Title"));

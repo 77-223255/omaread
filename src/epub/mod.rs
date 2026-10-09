@@ -1,7 +1,9 @@
 //! Reading EPUB containers: package document, spine and navigation.
 
+pub mod marks;
 pub mod mathml;
 pub mod xhtml;
+pub(crate) mod xml;
 
 use crate::doc::Chapter;
 use anyhow::{Context, Result, anyhow, bail};
@@ -65,6 +67,17 @@ pub struct Book {
     /// case: reflowable is the default, and a report that printed it as
     /// though the book had said so claimed more than the book did.
     pub layout: Option<String>,
+    /// A picture's pixel size once it has been asked for, by the path the
+    /// chapter spells it with; `None` for a header that would not read or
+    /// measure, remembered as firmly as a size.
+    ///
+    /// Every re-layout measures the chapter's pictures and hiding the marks
+    /// measured them first, so a header used to be read and parsed twice per
+    /// picture per pass — about 210 microseconds each, which a chapter of a
+    /// hundred of them paid twice over on every resize. A container entry
+    /// cannot change while the book is open, so the first answer is the last
+    /// one: read once, answered from here for the whole session.
+    sizes: HashMap<String, Option<(u32, u32)>>,
 }
 
 impl Book {
@@ -115,6 +128,7 @@ impl Book {
             cover,
             layout: package.layout,
             spine,
+            sizes: HashMap::new(),
         };
         book.apply_navigation(&package.nav_href, &package.ncx_href);
         // After navigation has had its say — its landmarks are the last place
@@ -134,10 +148,7 @@ impl Book {
             .clone();
         let source = read_entry(&mut self.archive, &item.href)?;
         // Image paths in a chapter are relative to the chapter's own directory.
-        let base = Path::new(&item.href)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let base = dir_of(&item.href);
         let parsed = xhtml::parse_in(&source, &base)
             .with_context(|| format!("cannot parse chapter {}", item.href))?;
         Ok(Chapter {
@@ -146,6 +157,17 @@ impl Book {
             links: parsed.links,
             anchors: parsed.anchors,
         })
+    }
+
+    /// The name of the chapter at `index` of the reading order: the title the
+    /// book gave it, or its number in the spine when it gave none — one
+    /// fallback, so the contents, an export and a search hit all call the same
+    /// chapter the same thing.
+    pub fn chapter_title(&self, index: usize) -> String {
+        self.spine
+            .get(index)
+            .and_then(|item| item.title.clone())
+            .unwrap_or_else(|| format!("Chapter {}", index + 1))
     }
 
     pub fn title(&self) -> &str {
@@ -191,28 +213,69 @@ impl Book {
             .with_context(|| format!("{name} is missing from the container"))
     }
 
+    /// The pixel size of one of its pictures, read from the header alone.
+    ///
+    /// A picture is measured on every re-layout and was measured once more
+    /// when its marks were hidden, so the same header was read and parsed
+    /// over and over for an answer that cannot change: the size is read once
+    /// per picture and remembered here, failures included — a header that
+    /// would not read or measure gives no room to a picture either time, and
+    /// re-reading it could only arrive at the same nothing.
+    pub fn picture_size(&mut self, src: &str) -> Option<(u32, u32)> {
+        if let Some(known) = self.sizes.get(src) {
+            return *known;
+        }
+        let size = self
+            .read_header(src)
+            .ok()
+            .and_then(|bytes| crate::image::dimensions(&bytes).ok());
+        self.sizes.insert(src.to_string(), size);
+        size
+    }
+
+    /// How many of its pictures' headers have actually been read: one per
+    /// distinct picture, whatever the callers have asked since.
+    #[cfg(test)]
+    pub(crate) fn header_reads(&self) -> usize {
+        self.sizes.len()
+    }
+
     /// Fills in spine titles from the navigation document, preferring EPUB 3's
     /// nav over EPUB 2's NCX, and picks up the cover from the nav's landmarks
     /// when nothing else named it.
     fn apply_navigation(&mut self, nav_href: &Option<String>, ncx_href: &Option<String>) {
         let mut titles = None;
         if let Some(href) = nav_href {
-            let full = normalize(&self.root.clone(), href);
+            let full = normalize(&self.root, href);
             if let Ok(xml) = read_entry(&mut self.archive, &full) {
-                // The landmarks are the last of the places readers look for a
-                // cover, and only worth asking when the others stayed silent.
-                if self.cover.is_none() {
-                    self.cover = parse_cover_landmark(&xml, &full);
+                // The navigation is read the same way a chapter is: named
+                // entities first, because roxmltree only knows XML's own five.
+                let cleaned = crate::epub::xml::clean(&xml);
+                if let Ok(doc) =
+                    roxmltree::Document::parse_with_options(&cleaned, crate::epub::xml::options())
+                {
+                    // One parse of the navigation answers both questions: the
+                    // landmarks and the titles are the same document, and reading
+                    // it twice over spent a second chapter's parse on bytes already
+                    // in hand. The landmarks are the last of the places readers
+                    // look for a cover, so they are asked only when the others
+                    // stayed silent.
+                    if self.cover.is_none() {
+                        self.cover = parse_cover_landmark(&doc, &full);
+                    }
+                    titles = Some(parse_nav(&doc, &full));
                 }
-                titles = parse_nav(&xml, &full).ok();
             }
         }
         let titles = titles.or_else(|| {
             ncx_href.as_ref().and_then(|href| {
-                let full = normalize(&self.root.clone(), href);
-                read_entry(&mut self.archive, &full)
-                    .ok()
-                    .and_then(|xml| parse_ncx(&xml, &full).ok())
+                let full = normalize(&self.root, href);
+                let xml = read_entry(&mut self.archive, &full).ok()?;
+                let cleaned = crate::epub::xml::clean(&xml);
+                let doc =
+                    roxmltree::Document::parse_with_options(&cleaned, crate::epub::xml::options())
+                        .ok()?;
+                Some(parse_ncx(&doc, &full))
             })
         });
 
@@ -308,11 +371,7 @@ fn is_picture(media: &HashMap<String, String>, archive: &mut ZipArchive<File>, p
 /// The first picture an XHTML page holds, as a container path.
 fn first_picture_of(archive: &mut ZipArchive<File>, page: &str) -> Result<String> {
     let source = read_entry(archive, page)?;
-    let base = Path::new(page)
-        .parent()
-        .unwrap_or(Path::new(""))
-        .to_string_lossy()
-        .into_owned();
+    let base = dir_of(page);
     let parsed = xhtml::parse_in(&source, &base).with_context(|| format!("cannot parse {page}"))?;
     parsed
         .blocks
@@ -369,6 +428,16 @@ fn normalize(root: &Path, href: &str) -> String {
     container_path(&root.to_string_lossy(), href)
 }
 
+/// The directory a container path lives in: where the hrefs written inside
+/// that file resolve from.
+fn dir_of(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .unwrap_or(Path::new(""))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -391,7 +460,8 @@ fn percent_decode(text: &str) -> String {
 fn find_package_path(archive: &mut ZipArchive<File>) -> Result<String> {
     let container = read_entry(archive, "META-INF/container.xml")
         .context("not an EPUB: META-INF/container.xml is missing")?;
-    let doc = roxmltree::Document::parse_with_options(&container, xhtml::parsing_options())
+    let cleaned = crate::epub::xml::clean(&container);
+    let doc = roxmltree::Document::parse_with_options(&cleaned, crate::epub::xml::options())
         .context("container.xml is malformed")?;
     doc.descendants()
         .find(|n| n.is_element() && n.tag_name().name() == "rootfile")
@@ -416,7 +486,8 @@ struct Package {
 }
 
 fn parse_package(xml: &str) -> Result<Package> {
-    let doc = roxmltree::Document::parse_with_options(xml, xhtml::parsing_options())
+    let cleaned = crate::epub::xml::clean(xml);
+    let doc = roxmltree::Document::parse_with_options(&cleaned, crate::epub::xml::options())
         .context("package document is malformed")?;
     let mut metadata = Metadata::default();
     let mut manifest = HashMap::new();
@@ -580,10 +651,9 @@ fn text_of(node: roxmltree::Node) -> Option<String> {
     }
 }
 
-/// Maps chapter paths to titles, taken from an EPUB 3 navigation document.
-fn parse_nav(xml: &str, nav_path: &str) -> Result<HashMap<String, String>> {
-    let doc = roxmltree::Document::parse_with_options(xml, xhtml::parsing_options())
-        .context("navigation document is malformed")?;
+/// Maps chapter paths to titles, taken from an EPUB 3 navigation document that
+/// has already been parsed.
+fn parse_nav(doc: &roxmltree::Document, nav_path: &str) -> HashMap<String, String> {
     let base = Path::new(nav_path).parent().unwrap_or(Path::new(""));
     let mut titles = HashMap::new();
 
@@ -599,7 +669,7 @@ fn parse_nav(xml: &str, nav_path: &str) -> Result<HashMap<String, String>> {
             doc.descendants()
                 .find(|n| n.is_element() && n.tag_name().name() == "nav")
         });
-    let Some(toc) = toc else { return Ok(titles) };
+    let Some(toc) = toc else { return titles };
 
     for anchor in toc
         .descendants()
@@ -609,7 +679,7 @@ fn parse_nav(xml: &str, nav_path: &str) -> Result<HashMap<String, String>> {
             titles.entry(normalize(base, href)).or_insert(title);
         }
     }
-    Ok(titles)
+    titles
 }
 
 /// The cover's href from an EPUB 3 navigation document's landmarks.
@@ -618,8 +688,7 @@ fn parse_nav(xml: &str, nav_path: &str) -> Result<HashMap<String, String>> {
 /// and the landmark typed `cover` points at the cover the way a guide
 /// reference does. This is the last of the places readers look, so the caller
 /// asks only when nothing else named the cover.
-fn parse_cover_landmark(xml: &str, nav_path: &str) -> Option<String> {
-    let doc = roxmltree::Document::parse_with_options(xml, xhtml::parsing_options()).ok()?;
+fn parse_cover_landmark(doc: &roxmltree::Document, nav_path: &str) -> Option<String> {
     let base = Path::new(nav_path).parent().unwrap_or(Path::new(""));
     let landmarks = doc.descendants().find(|n| {
         n.is_element()
@@ -639,10 +708,9 @@ fn parse_cover_landmark(xml: &str, nav_path: &str) -> Option<String> {
     Some(normalize(base, href))
 }
 
-/// Maps chapter paths to titles, taken from an EPUB 2 NCX document.
-fn parse_ncx(xml: &str, ncx_path: &str) -> Result<HashMap<String, String>> {
-    let doc = roxmltree::Document::parse_with_options(xml, xhtml::parsing_options())
-        .context("NCX document is malformed")?;
+/// Maps chapter paths to titles, taken from an EPUB 2 NCX document that has
+/// already been parsed.
+fn parse_ncx(doc: &roxmltree::Document, ncx_path: &str) -> HashMap<String, String> {
     let base = Path::new(ncx_path).parent().unwrap_or(Path::new(""));
     let mut titles = HashMap::new();
 
@@ -662,7 +730,7 @@ fn parse_ncx(xml: &str, ncx_path: &str) -> Result<HashMap<String, String>> {
             titles.entry(normalize(base, href)).or_insert(title);
         }
     }
-    Ok(titles)
+    titles
 }
 
 #[cfg(test)]
@@ -729,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cover_is_found_whichever_way_the_book_names_it() {
+    fn a_cover_declared_by_properties_outranks_the_older_ways() {
         // EPUB 3's own way: `properties` on the manifest item, among whatever
         // else that item declares. It outranks the older ways when a book
         // carries more than one.
@@ -748,7 +816,10 @@ mod tests {
         </package>"#;
         let package = parse_package(opf).unwrap();
         assert_eq!(package.cover.as_deref(), Some("Images/cover.png"));
+    }
 
+    #[test]
+    fn an_old_book_names_the_manifest_item_that_holds_the_cover() {
         // EPUB 2 predates `properties`: the metadata names the id of the
         // manifest item that holds the picture, and the href comes from there.
         let opf = r#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
@@ -764,24 +835,10 @@ mod tests {
         </package>"#;
         let package = parse_package(opf).unwrap();
         assert_eq!(package.cover.as_deref(), Some("cover.jpg"));
+    }
 
-        // The oldest way to say it: a `guide` reference typed `cover`, pointing
-        // at whatever holds the cover. Its href is kept as written here and
-        // resolved against the package document's directory on the way out of
-        // `Book::open`, where a page is followed to its first picture.
-        let opf = r#"<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
-          <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-            <dc:title>Guided</dc:title>
-          </metadata>
-          <manifest>
-            <item id="c1" href="ch01.xhtml" media-type="application/xhtml+xml"/>
-          </manifest>
-          <spine><itemref idref="c1"/></spine>
-          <guide><reference type="cover" href="text/cover.xhtml" title="Cover"/></guide>
-        </package>"#;
-        let package = parse_package(opf).unwrap();
-        assert_eq!(package.cover.as_deref(), Some("text/cover.xhtml"));
-
+    #[test]
+    fn a_guide_type_that_merely_contains_cover_is_not_one() {
         // A type that merely contains the word points at something else — a
         // `my-coverish` section is not a cover, and believing it made a
         // stranger's section the cover.
@@ -797,23 +854,34 @@ mod tests {
             let package = parse_package(&opf).unwrap();
             assert_eq!(package.cover, None, "type {kind:?} is not a cover");
         }
+    }
 
-        // And the last place readers look: the landmarks of the navigation
+    #[test]
+    fn the_navigation_landmarks_name_the_cover_when_nothing_else_does() {
+        // The last place readers look: the landmarks of the navigation
         // document, for books that mark nothing in the manifest.
         let nav = r#"<html xmlns:epub="http://www.idpf.org/2007/ops">
           <body><nav epub:type="landmarks"><ol>
             <li><a epub:type="cover" href="cover.xhtml">Cover</a></li>
             <li><a epub:type="text" href="text/ch01.xhtml">Start</a></li>
           </ol></nav></body></html>"#;
+        let cleaned_nav = crate::epub::xml::clean(nav);
+        let nav_doc =
+            roxmltree::Document::parse_with_options(&cleaned_nav, crate::epub::xml::options())
+                .unwrap();
         assert_eq!(
-            parse_cover_landmark(nav, "OEBPS/nav.xhtml").as_deref(),
+            parse_cover_landmark(&nav_doc, "OEBPS/nav.xhtml").as_deref(),
             Some("OEBPS/cover.xhtml")
         );
         // A nav without landmarks, or without a cover among them, names
         // nothing — and nothing is what the caller asked for.
         let toc = r#"<html xmlns:epub="http://www.idpf.org/2007/ops">
           <body><nav epub:type="toc"><ol><li><a href="ch01.xhtml">One</a></li></ol></nav></body></html>"#;
-        assert!(parse_cover_landmark(toc, "OEBPS/nav.xhtml").is_none());
+        let cleaned_toc = crate::epub::xml::clean(toc);
+        let doc =
+            roxmltree::Document::parse_with_options(&cleaned_toc, crate::epub::xml::options())
+                .unwrap();
+        assert!(parse_cover_landmark(&doc, "OEBPS/nav.xhtml").is_none());
     }
 
     #[test]
@@ -870,7 +938,11 @@ mod tests {
             <li><a href="ch01.xhtml">First</a></li>
             <li><a href="ch02.xhtml#top">Second</a></li>
           </ol></nav></body></html>"#;
-        let titles = parse_nav(nav, "OEBPS/nav.xhtml").unwrap();
+        let cleaned_nav = crate::epub::xml::clean(nav);
+        let nav_doc =
+            roxmltree::Document::parse_with_options(&cleaned_nav, crate::epub::xml::options())
+                .unwrap();
+        let titles = parse_nav(&nav_doc, "OEBPS/nav.xhtml");
         assert_eq!(
             titles.get("OEBPS/ch01.xhtml").map(String::as_str),
             Some("First")
@@ -885,51 +957,79 @@ mod tests {
           <navPoint><navLabel><text>Chapter One</text></navLabel>
             <content src="ch01.xhtml"/></navPoint>
         </navMap></ncx>"#;
-        let titles = parse_ncx(ncx, "OEBPS/toc.ncx").unwrap();
+        let cleaned_ncx = crate::epub::xml::clean(ncx);
+        let ncx_doc =
+            roxmltree::Document::parse_with_options(&cleaned_ncx, crate::epub::xml::options())
+                .unwrap();
+        let titles = parse_ncx(&ncx_doc, "OEBPS/toc.ncx");
         assert_eq!(
             titles.get("OEBPS/ch01.xhtml").map(String::as_str),
             Some("Chapter One")
         );
     }
 
-    /// Writes a container with the given entries, so `Book::open` can be
-    /// driven the way a reader drives it — from a file on disk.
-    fn container(name: &str, entries: &[(&str, &str)]) -> PathBuf {
-        use std::io::Write;
-        let path = crate::testkit::path(name, ".epub");
-        let file = File::create(&path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default();
-        for (name, body) in entries {
-            zip.start_file(*name, options).unwrap();
-            zip.write_all(body.as_bytes()).unwrap();
+    #[test]
+    fn named_entities_are_resolved_and_xmls_own_are_left_to_the_parser() {
+        // roxmltree resolves only XML's five entities, so every document takes
+        // a cleaning pass first: without it an em dash in the title was an
+        // entity it could not resolve and the whole package document failed to
+        // parse. An ampersand written the XML way must pass through untouched —
+        // cleaning one first would hand the parser a bare `&` to read as the
+        // start of an entity nobody declared.
+        for (title, expected) in [
+            ("A &mdash; B", "A \u{2014} B"),
+            ("Snakes &amp; Ladders", "Snakes & Ladders"),
+        ] {
+            let path = crate::testkit::container(
+                "entity-title",
+                &[
+                    ("META-INF/container.xml", crate::testkit::CONTAINER),
+                    ("OEBPS/content.opf", &crate::testkit::opf(title, "")),
+                    (
+                        "OEBPS/ch0.xhtml",
+                        &crate::testkit::chapter_xhtml("<p>text</p>"),
+                    ),
+                ],
+            );
+            let book = Book::open(&path).unwrap();
+            assert_eq!(book.title(), expected);
+            std::fs::remove_file(path).ok();
         }
-        zip.finish().unwrap();
-        path
+
+        // A navigation label is read the way a chapter is: a non-breaking
+        // space is not one of XML's entities, and a label that lost it lost
+        // the space the publisher put between two words.
+        let nav = r#"<html xmlns:epub="http://www.idpf.org/2007/ops">
+          <body><nav epub:type="toc"><ol>
+            <li><a href="ch0.xhtml">First&nbsp;Chapter</a></li>
+          </ol></nav></body></html>"#;
+        // The package document is where a test names the navigation document.
+        let nav_item = r#"<item id="nav" href="nav.xhtml"
+            media-type="application/xhtml+xml" properties="nav"/>"#;
+        let path = crate::testkit::container(
+            "entity-nav",
+            &[
+                ("META-INF/container.xml", crate::testkit::CONTAINER),
+                (
+                    "OEBPS/content.opf",
+                    &crate::testkit::opf("Nav Book", nav_item),
+                ),
+                (
+                    "OEBPS/ch0.xhtml",
+                    &crate::testkit::chapter_xhtml("<p>text</p>"),
+                ),
+                ("OEBPS/nav.xhtml", nav.as_bytes()),
+            ],
+        );
+        let book = Book::open(&path).unwrap();
+        assert_eq!(book.spine[0].title.as_deref(), Some("First\u{00a0}Chapter"));
+        std::fs::remove_file(path).ok();
     }
 
-    const CONTAINER_XML: &str = r#"<?xml version="1.0"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
-</container>"#;
-
-    const CHAPTER: &str = r#"<?xml version="1.0"?>
-<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head>
-<body><p>text</p></body></html>"#;
-
-    const OPF: &str = r#"<?xml version="1.0"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
-<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>One</dc:title></metadata>
-<manifest><item id="c0" href="ch0.xhtml" media-type="application/xhtml+xml"/></manifest>
-<spine><itemref idref="c0"/></spine></package>"#;
-
-    #[test]
-    fn a_cover_named_by_a_guide_is_followed_to_its_picture_or_gives_up() {
-        // A `guide` reference names an XHTML *page*; compared against an
-        // `<img src>` it never matched, so those covers were never drawn —
-        // most books name the cover this way. The page is opened and its
-        // first picture taken, and that is the cover from here on.
-        let opf = r#"<?xml version="1.0"?>
+    /// A guide-named cover: the `guide` reference points at an XHTML *page*,
+    /// which holds the picture. The form both guide-cover tests ask their
+    /// question of.
+    const GUIDE_OPF: &str = r#"<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Guided</dc:title></metadata>
 <manifest>
@@ -940,61 +1040,158 @@ mod tests {
 <spine><itemref idref="c0"/></spine>
 <guide><reference type="cover" href="text/cover.xhtml" title="Cover"/></guide>
 </package>"#;
+
+    #[test]
+    fn a_cover_named_by_a_guide_is_followed_to_its_picture() {
+        // A `guide` reference names an XHTML *page*; compared against an
+        // `<img src>` it never matched, so those covers were never drawn —
+        // most books name the cover this way. The page is opened and its
+        // first picture taken, and that is the cover from here on.
+        let package = parse_package(GUIDE_OPF).unwrap();
+        // Out of `parse_package` the href is kept as written, resolved against
+        // the package document's directory on the way out of `Book::open`.
+        assert_eq!(package.cover.as_deref(), Some("text/cover.xhtml"));
+
         let page = r#"<?xml version="1.0"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head>
 <body><img src="../images/cover.png" alt="Cover"/><p>back</p></body></html>"#;
-        let path = container(
+        let path = crate::testkit::container(
             "guide-cover",
             &[
-                ("META-INF/container.xml", CONTAINER_XML),
-                ("OEBPS/content.opf", opf),
-                ("OEBPS/ch0.xhtml", CHAPTER),
-                ("OEBPS/text/cover.xhtml", page),
+                ("META-INF/container.xml", crate::testkit::CONTAINER),
+                ("OEBPS/content.opf", GUIDE_OPF.as_bytes()),
+                (
+                    "OEBPS/ch0.xhtml",
+                    &crate::testkit::chapter_xhtml("<p>text</p>"),
+                ),
+                ("OEBPS/text/cover.xhtml", page.as_bytes()),
                 // Never opened here: the cover is followed by its media type.
-                ("OEBPS/images/cover.png", "not really a png"),
+                ("OEBPS/images/cover.png", b"not really a png"),
             ],
         );
         let book = Book::open(&path).unwrap();
         assert_eq!(book.cover.as_deref(), Some("OEBPS/images/cover.png"));
-        // The picture the page held is classified as the cover, so the size
-        // rule for covers finally has something to match.
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_guide_page_with_no_picture_is_not_a_cover() {
+        // Only a cover that resolves to something with an image media type is
+        // kept. A page with no picture in it reads as `-` in a report, rather
+        // than as a cover that is never drawn.
+        let page = r#"<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head>
+<body><p>a page about the cover, with no picture on it</p></body></html>"#;
+        let path = crate::testkit::container(
+            "pageless-cover",
+            &[
+                ("META-INF/container.xml", crate::testkit::CONTAINER),
+                ("OEBPS/content.opf", GUIDE_OPF.as_bytes()),
+                (
+                    "OEBPS/ch0.xhtml",
+                    &crate::testkit::chapter_xhtml("<p>text</p>"),
+                ),
+                ("OEBPS/text/cover.xhtml", page.as_bytes()),
+            ],
+        );
+        let book = Book::open(&path).unwrap();
+        assert_eq!(book.cover, None, "a page with no picture is no cover");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_picture_is_classified_by_the_cover_and_the_layout() {
+        // The size rule asks every picture why it is there: the cover is
+        // asked for first and fills the room, a page of a pre-paginated book
+        // fills it too, and everything else keeps its own shape in the flow.
+        let opf = r#"<package xmlns="http://www.idpf.org/2007/opf"
+                     xmlns:rendition="http://www.idpf.org/2007/ops"
+                     version="3.0" rendition:layout="pre-paginated">
+          <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Fixed</dc:title></metadata>
+          <manifest>
+            <item id="c0" href="ch0.xhtml" media-type="application/xhtml+xml"/>
+            <item id="cv" href="cv.png" media-type="image/png" properties="cover-image"/>
+            <item id="art" href="art.png" media-type="image/png"/>
+          </manifest>
+          <spine><itemref idref="c0"/></spine>
+        </package>"#;
+        let path = crate::testkit::book_with(
+            "picture-reasons",
+            "Fixed",
+            &[r#"<p><img src="cv.png" alt="cover"/><img src="art.png" alt="art"/></p>"#],
+            &[
+                ("OEBPS/content.opf", opf.as_bytes()),
+                ("OEBPS/cv.png", &crate::testkit::png(4, 4, [1, 2, 3, 255])),
+                ("OEBPS/art.png", &crate::testkit::png(4, 4, [4, 5, 6, 255])),
+            ],
+        );
+        let book = Book::open(&path).unwrap();
         assert_eq!(
-            book.picture_reason("OEBPS/images/cover.png"),
+            book.picture_reason("OEBPS/cv.png"),
             crate::image::Reason::Cover
         );
+        assert_eq!(
+            book.picture_reason("OEBPS/art.png"),
+            crate::image::Reason::Page
+        );
+        std::fs::remove_file(path).ok();
+
+        // And a picture that is not the cover of a reflowable book is flow.
+        let path = crate::testkit::book("picture-flow", "Plain", &["<p>text</p>"]);
+        let book = Book::open(&path).unwrap();
         assert_eq!(
             book.picture_reason("OEBPS/ch0.xhtml"),
             crate::image::Reason::Flow
         );
         std::fs::remove_file(path).ok();
+    }
 
-        // Only a cover that resolves to something with an image media type is
-        // kept. A page with no picture in it reads as `-` in a report, rather
-        // than as a cover that is never drawn.
-        let opf = r#"<?xml version="1.0"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
-<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Empty</dc:title></metadata>
-<manifest>
-  <item id="c0" href="ch0.xhtml" media-type="application/xhtml+xml"/>
-  <item id="pg" href="text/cover.xhtml" media-type="application/xhtml+xml"/>
-</manifest>
-<spine><itemref idref="c0"/></spine>
-<guide><reference type="cover" href="text/cover.xhtml" title="Cover"/></guide>
-</package>"#;
-        let page = r#"<?xml version="1.0"?>
-<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head>
-<body><p>a page about the cover, with no picture on it</p></body></html>"#;
-        let path = container(
-            "pageless-cover",
+    #[test]
+    fn a_picture_size_is_read_once_and_then_answered_from_memory() {
+        // The layout and the hiding of the marks both ask every picture how
+        // big it is; without the cache each pass read the header again — 210
+        // microseconds per picture, twice per chapter load and once more per
+        // resize. The second question must not open the container again, and
+        // a header that cannot be read or measured must stay "no size" the
+        // same way, once, rather than being retried into the same nothing.
+        let path = crate::testkit::book_with(
+            "picture-size",
+            "Sizes",
+            &[r#"<p><img src="art.png" alt="art"/></p>"#],
             &[
-                ("META-INF/container.xml", CONTAINER_XML),
-                ("OEBPS/content.opf", opf),
-                ("OEBPS/ch0.xhtml", CHAPTER),
-                ("OEBPS/text/cover.xhtml", page),
+                (
+                    "OEBPS/content.opf",
+                    &crate::testkit::opf(
+                        "Sizes",
+                        r#"<item id="art" href="art.png" media-type="image/png"/>"#,
+                    ),
+                ),
+                (
+                    "OEBPS/art.png",
+                    &crate::testkit::png(120, 80, [1, 2, 3, 255]),
+                ),
             ],
         );
-        let book = Book::open(&path).unwrap();
-        assert_eq!(book.cover, None, "a page with no picture is no cover");
+        let mut book = Book::open(&path).unwrap();
+
+        assert_eq!(book.picture_size("OEBPS/art.png"), Some((120, 80)));
+        assert_eq!(
+            book.picture_size("OEBPS/art.png"),
+            Some((120, 80)),
+            "the size changed between two asks of the same picture"
+        );
+        assert_eq!(book.header_reads(), 1, "the header was read a second time");
+
+        // An entry that is not a picture at all: the header reads, the size
+        // does not, and that failure is answered from memory too.
+        assert_eq!(book.picture_size("OEBPS/content.opf"), None);
+        assert_eq!(book.picture_size("OEBPS/content.opf"), None);
+        assert_eq!(book.header_reads(), 2, "the unreadable size was read again");
+
+        // And one that is not in the container: the same once.
+        assert_eq!(book.picture_size("OEBPS/nope.png"), None);
+        assert_eq!(book.picture_size("OEBPS/nope.png"), None);
+        assert_eq!(book.header_reads(), 3, "the missing entry was read again");
         std::fs::remove_file(path).ok();
     }
 
@@ -1005,13 +1202,16 @@ mod tests {
         // the limit is refused — by name, so the message says which file did
         // it — instead of being believed.
         let big = "x".repeat(MAX_ENTRY_BYTES as usize + 1);
-        let path = container(
+        let path = crate::testkit::container(
             "entry-cap",
             &[
-                ("META-INF/container.xml", CONTAINER_XML),
-                ("OEBPS/content.opf", OPF),
-                ("OEBPS/ch0.xhtml", CHAPTER),
-                ("OEBPS/big.xhtml", &big),
+                ("META-INF/container.xml", crate::testkit::CONTAINER),
+                ("OEBPS/content.opf", &crate::testkit::opf("One", "")),
+                (
+                    "OEBPS/ch0.xhtml",
+                    &crate::testkit::chapter_xhtml("<p>text</p>"),
+                ),
+                ("OEBPS/big.xhtml", big.as_bytes()),
             ],
         );
         let mut archive = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();

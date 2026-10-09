@@ -81,14 +81,17 @@ fn nearest(palette: &[(u8, u8, u8)], pixel: (u8, u8, u8)) -> usize {
     best
 }
 
-/// Encodes an image as a Sixel escape sequence.
+/// Encodes an image as Sixel, in the pieces a crop writes: the palette header,
+/// then one string per band — each band carrying the `-` that moves on to the
+/// next one while another follows, and none of them the terminator, which the
+/// writer puts on the end.
 ///
 /// The image must already be scaled to its final pixel size, because Sixel
 /// carries no scaling of its own.
-pub fn encode(image: &RgbaImage) -> String {
+pub fn encode(image: &RgbaImage) -> (String, Vec<String>) {
     let (width, height) = (image.width(), image.height());
     if width == 0 || height == 0 {
-        return String::new();
+        return (String::new(), Vec::new());
     }
     let palette = palette();
 
@@ -102,18 +105,18 @@ pub fn encode(image: &RgbaImage) -> String {
         used[index] = true;
     }
 
-    let mut out = String::with_capacity((width * height / 4) as usize + 1024);
     // P q introduces the data; the raster attributes give the aspect ratio 1:1
     // and the pixel size, which lets a terminal reserve the right area.
-    out.push_str("\x1bP0;1;0q\"1;1;");
-    out.push_str(&format!("{width};{height}"));
+    let mut header = String::with_capacity(64);
+    header.push_str("\x1bP0;1;0q\"1;1;");
+    header.push_str(&format!("{width};{height}"));
 
     for (index, &(r, g, b)) in palette.iter().enumerate() {
         if !used[index] {
             continue;
         }
         // Sixel colour components are percentages.
-        out.push_str(&format!(
+        header.push_str(&format!(
             "#{};2;{};{};{}",
             index,
             percent(r),
@@ -122,8 +125,10 @@ pub fn encode(image: &RgbaImage) -> String {
         ));
     }
 
-    let bands = height.div_ceil(6);
-    for band in 0..bands {
+    let count = height.div_ceil(6);
+    let mut bands = Vec::with_capacity(count as usize);
+    for band in 0..count {
+        let mut text = String::with_capacity((width / 4) as usize + 64);
         let mut first_colour = true;
         for (colour, is_used) in used.iter().enumerate() {
             if !is_used {
@@ -153,17 +158,33 @@ pub fn encode(image: &RgbaImage) -> String {
             }
             if !first_colour {
                 // Return to the start of the band for the next colour.
-                out.push('$');
+                text.push('$');
             }
             first_colour = false;
-            out.push_str(&format!("#{colour}"));
-            write_run(&mut out, &run);
+            text.push_str(&format!("#{colour}"));
+            write_run(&mut text, &run);
         }
-        if band + 1 < bands {
-            out.push('-');
+        if band + 1 < count {
+            text.push('-');
         }
+        bands.push(text);
     }
 
+    (header, bands)
+}
+
+/// The whole escape: header, every band in order, terminator — what a frame
+/// that shows a picture in full writes, and what the pieces of `encode` must
+/// add up to byte for byte.
+pub fn whole(header: &str, bands: &[String]) -> String {
+    if header.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(header.len() + 2);
+    out.push_str(header);
+    for band in bands {
+        out.push_str(band);
+    }
     out.push_str("\x1b\\");
     out
 }
@@ -199,17 +220,37 @@ mod tests {
     use super::*;
     use image::Rgba;
 
+    /// The picture `encode` reads, built the shared way: one flat colour at
+    /// the size the test names.
     fn solid(width: u32, height: u32, color: [u8; 4]) -> RgbaImage {
-        let mut buffer = RgbaImage::new(width, height);
-        for pixel in buffer.pixels_mut() {
-            *pixel = Rgba(color);
+        crate::testkit::image(width, height, color).to_rgba8()
+    }
+
+    /// The whole escape for a picture, which is what a frame that shows it
+    /// writes.
+    fn encoded(image: &RgbaImage) -> String {
+        let (header, bands) = encode(image);
+        whole(&header, &bands)
+    }
+
+    /// Six columns of two alternating colours over twelve rows: two bands,
+    /// each of them carrying both colours, so a band range has something in
+    /// it to tell apart.
+    fn checkerboard() -> RgbaImage {
+        let mut image = RgbaImage::new(6, 12);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = Rgba(if (x + y) % 2 == 0 {
+                [200, 40, 60, 255]
+            } else {
+                [30, 160, 90, 255]
+            });
         }
-        buffer
+        image
     }
 
     #[test]
     fn an_encoded_image_is_well_formed() {
-        let escape = encode(&solid(4, 6, [255, 0, 0, 255]));
+        let escape = encoded(&solid(4, 6, [255, 0, 0, 255]));
         assert!(escape.starts_with("\x1bP"), "missing introducer");
         assert!(escape.contains("q\"1;1;4;6"), "missing raster attributes");
         assert!(escape.ends_with("\x1b\\"), "missing terminator");
@@ -221,16 +262,16 @@ mod tests {
     #[test]
     fn bands_runs_and_a_second_colour_are_written_out() {
         // Six rows of one colour means all six bits, so 63 + 63 = '~'.
-        let escape = encode(&solid(1, 6, [0, 0, 0, 255]));
+        let escape = encoded(&solid(1, 6, [0, 0, 0, 255]));
         assert!(escape.contains('~'), "{escape:?}");
         // Twelve rows are two bands.
-        let escape = encode(&solid(2, 12, [0, 0, 0, 255]));
+        let escape = encoded(&solid(2, 12, [0, 0, 0, 255]));
         assert_eq!(escape.matches('-').count(), 1, "expected one band break");
         // A run of twenty is worth compressing; three identical columns are
         // below the threshold for `!` and stay literal.
-        let escape = encode(&solid(20, 6, [0, 0, 0, 255]));
+        let escape = encoded(&solid(20, 6, [0, 0, 0, 255]));
         assert!(escape.contains("!20"), "expected a run of 20: {escape:?}");
-        let escape = encode(&solid(3, 6, [0, 0, 0, 255]));
+        let escape = encoded(&solid(3, 6, [0, 0, 0, 255]));
         assert!(!escape.contains('!'), "{escape:?}");
         // A second colour in the same band needs the carriage return.
         let mut buffer = RgbaImage::new(2, 6);
@@ -238,7 +279,33 @@ mod tests {
             buffer.put_pixel(0, y, Rgba([255, 0, 0, 255]));
             buffer.put_pixel(1, y, Rgba([0, 0, 255, 255]));
         }
-        let escape = encode(&buffer);
+        let escape = encoded(&buffer);
         assert!(escape.contains('$'), "{escape:?}");
+    }
+
+    #[test]
+    fn the_pieces_add_up_to_the_escape_the_encoder_always_wrote() {
+        // Pinned from the encoder before it was split into pieces: a frame
+        // that shows a whole picture must write byte for byte what it wrote
+        // then, header, bands and terminator alike.
+        let old = "\x1bP0;1;0q\"1;1;6;12#56;2;20;60;40#151;2;80;20;20#56iTiTiT$#151TiTiTi-#56iTiTiT$#151TiTiTi\x1b\\";
+        let (header, bands) = encode(&checkerboard());
+        assert_eq!(bands.len(), 2, "twelve rows are two bands");
+        assert_eq!(whole(&header, &bands), old);
+        assert_eq!(format!("{header}{}\x1b\\", bands.concat()), old);
+    }
+
+    #[test]
+    fn a_crop_writes_the_bands_it_covers_and_the_terminator() {
+        // A picture is cropped to whole bands, never inside one: the second
+        // band of the pinned escape above, from just past the first band's
+        // `-` to the end, is the whole of what such a crop says.
+        let (header, bands) = encode(&checkerboard());
+        assert_eq!(
+            whole(&header, &bands[1..2]),
+            format!("{header}#56iTiTiT$#151TiTiTi\x1b\\")
+        );
+        // And every band in range is the whole picture again.
+        assert_eq!(whole(&header, &bands[0..]), whole(&header, &bands));
     }
 }

@@ -5,15 +5,21 @@
 //! primary device attributes, whose answer lists Sixel support as feature 4.
 //!
 //! Anything unanswered means no. A terminal that stays silent must not hold up
-//! the start, so the wait is short and failure is ordinary.
+//! the start, so the wait is short and failure is ordinary — the window these
+//! questions are asked in belongs to the session, which asks its own questions
+//! (the colours to draw with) in the same one.
 
-use std::io::{Read, Write};
-use std::time::{Duration, Instant};
+/// The question: a one-pixel Kitty image query, so a terminal that
+/// misunderstands it still paints nothing, and a primary device attributes
+/// request that every terminal answers — that answer marks the end of the
+/// replies, so the wait need not run out before the reply is classified.
+pub const ASK: &str = concat!("\x1b_Gi=1,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\", "\x1b[c");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// Two pixels per cell. Works in every terminal and through tmux.
-    HalfBlocks,
+    /// A block per cell: four quadrants, two colours, drawn as ordinary text.
+    /// Works in every terminal and through tmux.
+    Quad,
     /// Real pixels, supported by foot among others.
     Sixel,
     /// Real pixels, supported by Ghostty and kitty.
@@ -23,7 +29,7 @@ pub enum Backend {
 impl Backend {
     pub fn parse(text: &str) -> Option<Self> {
         match text.trim().to_ascii_lowercase().as_str() {
-            "halfblocks" | "half-blocks" | "half_blocks" | "blocks" => Some(Backend::HalfBlocks),
+            "quad" | "quadrant" => Some(Backend::Quad),
             "sixel" => Some(Backend::Sixel),
             "kitty" => Some(Backend::Kitty),
             _ => None,
@@ -31,88 +37,20 @@ impl Backend {
     }
 }
 
-/// How long to wait for a terminal to answer a query.
-const REPLY_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// Picks the best backend the terminal admits to supporting.
+/// Whether a pixel protocol could work here at all.
 ///
-/// Must run before the alternate screen is entered and while the terminal is in
-/// raw mode, because the answers arrive on stdin as escape sequences.
-pub fn detect() -> Backend {
-    // Inside a multiplexer the pixel protocols are out of reach. tmux manages the
-    // screen itself and knows nothing about the pixels a passthrough would put
-    // there, so a picture would survive scrolling and cover the text. Half blocks
-    // are ordinary cells and behave.
-    if std::env::var_os("TMUX").is_some() || is_screen() {
-        return Backend::HalfBlocks;
-    }
-
-    match query() {
-        Some(reply) => classify(&reply),
-        None => Backend::HalfBlocks,
-    }
+/// Inside a multiplexer the pixel protocols are out of reach. tmux manages the
+/// screen itself and knows nothing about the pixels a passthrough would put
+/// there, so a picture would survive scrolling and cover the text. Blocks are
+/// made of ordinary cells and behave.
+pub fn pixels_possible() -> bool {
+    std::env::var_os("TMUX").is_none() && !is_screen()
 }
 
 fn is_screen() -> bool {
     std::env::var("TERM")
         .map(|term| term.starts_with("screen"))
         .unwrap_or(false)
-}
-
-/// Sends both queries at once, followed by a primary device attributes request
-/// that every terminal answers. That last answer marks the end of the replies,
-/// so there is no need to wait out the timeout when the terminal is quick.
-fn query() -> Option<String> {
-    // A one-pixel image, so the query costs nothing even if it is displayed by a
-    // terminal that misunderstands it.
-    const KITTY: &str = "\x1b_Gi=1,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
-    const DEVICE_ATTRIBUTES: &str = "\x1b[c";
-
-    let mut out = std::io::stdout();
-    out.write_all(KITTY.as_bytes()).ok()?;
-    out.write_all(DEVICE_ATTRIBUTES.as_bytes()).ok()?;
-    out.flush().ok()?;
-
-    let deadline = Instant::now() + REPLY_TIMEOUT;
-    let mut reply = String::new();
-    let mut buffer = [0u8; 256];
-    let mut stdin = std::io::stdin();
-
-    while Instant::now() < deadline {
-        if !readable(&deadline) {
-            continue;
-        }
-        match stdin.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                reply.push_str(&String::from_utf8_lossy(&buffer[..read]));
-                // The device attributes answer ends in `c` and comes last.
-                if reply.contains('c') && reply.contains("\x1b[?") {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    if reply.is_empty() { None } else { Some(reply) }
-}
-
-/// Waits for input without spinning, using poll on the raw file descriptor.
-fn readable(deadline: &Instant) -> bool {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return false;
-    }
-    let mut fds = [libc::pollfd {
-        fd: libc::STDIN_FILENO,
-        events: libc::POLLIN,
-        revents: 0,
-    }];
-    let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
-    // Safety: the descriptor is stdin and the array is valid for the call.
-    let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, millis) };
-    ready > 0 && fds[0].revents & libc::POLLIN != 0
 }
 
 /// Reads a terminal's answers. Kitty support outranks Sixel, because it carries
@@ -124,7 +62,7 @@ pub fn classify(reply: &str) -> Backend {
     if supports_sixel(reply) {
         return Backend::Sixel;
     }
-    Backend::HalfBlocks
+    Backend::Quad
 }
 
 /// Looks for feature 4 in a primary device attributes answer, which is Sixel.
@@ -147,31 +85,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognises_a_kitty_answer() {
-        assert_eq!(classify("\x1b_Gi=1;OK\x1b\\\x1b[?62;c"), Backend::Kitty);
-        // And kitty wins when the same answer also offers sixel.
-        assert_eq!(
-            classify("\x1b_Gi=1;OK\x1b\\\x1b[?62;4;22c"),
-            Backend::Kitty
-        );
-    }
+    fn the_answer_is_what_picks_the_backend() {
+        // What a terminal may answer, and the backend a reader gets for it:
+        // kitty outranks sixel when it offers both, an answer without either
+        // feature leaves the blocks, and silence is the same as saying
+        // nothing at all.
+        let answers: &[(&str, Backend)] = &[
+            ("\x1b_Gi=1;OK\x1b\\\x1b[?62;c", Backend::Kitty),
+            ("\x1b_Gi=1;OK\x1b\\\x1b[?62;4;22c", Backend::Kitty),
+            ("\x1b[?62;4;22c", Backend::Sixel),
+            ("\x1b[?6c", Backend::Quad),
+            ("\x1b[?62;22c", Backend::Quad),
+            ("", Backend::Quad),
+            ("nonsense", Backend::Quad),
+        ];
+        for (reply, want) in answers {
+            assert_eq!(classify(reply), *want, "{reply:?}");
+        }
 
-    #[test]
-    fn recognises_sixel_only_where_the_terminal_says_so() {
-        // foot answers like this.
-        assert_eq!(classify("\x1b[?62;4;22c"), Backend::Sixel);
+        // Four is the Sixel feature — and forty, and fourteen, are not it.
         assert!(supports_sixel("\x1b[?62;4c"));
         assert!(supports_sixel("\x1b[?64;1;2;4;6;9;15;22c"));
-        // alacritty answers without Sixel — and 40 must not match 4.
-        assert_eq!(classify("\x1b[?6c"), Backend::HalfBlocks);
-        assert_eq!(classify("\x1b[?62;22c"), Backend::HalfBlocks);
         assert!(!supports_sixel("\x1b[?62;40c"), "40 must not match 4");
         assert!(!supports_sixel("\x1b[?14c"));
-    }
-
-    #[test]
-    fn silence_means_half_blocks() {
-        assert_eq!(classify(""), Backend::HalfBlocks);
-        assert_eq!(classify("nonsense"), Backend::HalfBlocks);
     }
 }

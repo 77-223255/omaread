@@ -11,6 +11,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+// The fixture kit the unit tests share, pulled in by path: this is a separate
+// crate, but a book written here must be the same book the reader's own tests
+// read.
+#[path = "../src/testkit.rs"]
+mod testkit;
+
+use testkit::Scratch;
+
 /// The scratch installation's environment: every XDG variable names a
 /// directory of its own, so a run reads and writes nothing this machine
 /// actually keeps.
@@ -33,43 +41,13 @@ fn omaread(scratch: &Path) -> Command {
     command
 }
 
-/// A scratch directory for one test: unique to this run, so two `cargo test`
-/// runs cannot delete each other's fixtures, and removed when the test ends,
-/// however it ends.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("omaread-cli-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl std::ops::Deref for Scratch {
-    type Target = PathBuf;
-
-    fn deref(&self) -> &PathBuf {
-        &self.0
-    }
-}
-
-impl AsRef<Path> for Scratch {
-    fn as_ref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A scratch directory, emptied first so each test starts from no library.
+/// A scratch directory for one test, emptied first so each test starts from
+/// no library: unique to this run, so two `cargo test` runs cannot delete each
+/// other's fixtures, and removed when the test ends, however it ends.
 fn scratch(name: &str) -> Scratch {
-    Scratch::new(name)
+    let dir = Scratch::new(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 fn stdout(out: &Output) -> String {
@@ -90,58 +68,32 @@ fn field(text: &str, label: &str) -> Option<String> {
 }
 
 /// A minimal EPUB with one chapter per entry, which is all any of these
-/// commands asks of a book.
+/// commands asks of a book. The author sits in the file, because reading one
+/// back out again is what `authors` is about.
 fn book(path: &Path, title: &str, chapters: &[&str]) {
+    let bodies: Vec<String> = chapters
+        .iter()
+        .enumerate()
+        .map(|(i, text)| format!("<h1>Chapter {n}</h1><p>{text}</p>", n = i + 1))
+        .collect();
+    let bodies: Vec<&str> = bodies.iter().map(String::as_str).collect();
+    place(
+        path,
+        testkit::named_book(
+            "cli-book",
+            title,
+            "Stephenson",
+            &format!("urn:test-{title}"),
+            &bodies,
+        ),
+    );
+}
+
+/// The book where the test asked for it: the shared writer builds in the temp
+/// dir, and the library scans a directory of its own.
+fn place(path: &Path, built: PathBuf) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let file = std::fs::File::create(path).unwrap();
-    let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default();
-
-    zip.start_file("mimetype", options).unwrap();
-    zip.write_all(b"application/epub+zip").unwrap();
-    zip.start_file("META-INF/container.xml", options).unwrap();
-    zip.write_all(
-        br#"<?xml version="1.0"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
-</container>"#,
-    )
-    .unwrap();
-
-    let items: String = (0..chapters.len())
-        .map(|i| {
-            format!("<item id=\"c{i}\" href=\"ch{i}.xhtml\" media-type=\"application/xhtml+xml\"/>")
-        })
-        .collect();
-    let refs: String = (0..chapters.len())
-        .map(|i| format!("<itemref idref=\"c{i}\"/>"))
-        .collect();
-    zip.start_file("OEBPS/content.opf", options).unwrap();
-    write!(
-        zip,
-        r#"<?xml version="1.0"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
-<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-<dc:title>{title}</dc:title><dc:creator>Stephenson</dc:creator>
-<dc:language>en</dc:language><dc:identifier id="id">urn:test-{title}</dc:identifier>
-</metadata>
-<manifest>{items}</manifest><spine>{refs}</spine></package>"#
-    )
-    .unwrap();
-
-    for (i, text) in chapters.iter().enumerate() {
-        zip.start_file(format!("OEBPS/ch{i}.xhtml"), options)
-            .unwrap();
-        write!(
-            zip,
-            r#"<?xml version="1.0"?>
-<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head>
-<body><h1>Chapter {n}</h1><p>{text}</p></body></html>"#,
-            n = i + 1
-        )
-        .unwrap();
-    }
-    zip.finish().unwrap();
+    std::fs::rename(built, path).unwrap();
 }
 
 /// A scratch library with one two-chapter book in it.
@@ -158,48 +110,60 @@ fn scanned(name: &str) -> Scratch {
     dir
 }
 
-/// The id the library gives a file: its content hash, as the reader computes it.
-fn id_of(path: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path).unwrap();
-    let digest = Sha256::digest(bytes);
-    let mut id = String::from("sha256:");
-    for byte in digest.iter() {
-        id.push_str(&format!("{byte:02x}"));
-    }
-    id
+/// A scratch library with one scanned book, and the id the library gave it:
+/// the fixture the library commands are answered against.
+fn a_scanned_library(name: &str) -> (Scratch, String) {
+    let dir = scanned(name);
+    let id = testkit::id_of(&dir.join("books/anathem.epub"));
+    (dir, id)
+}
+
+/// Where the reader stopped, written into the library's journal the way the
+/// reader writes it.
+fn a_recorded_position(dir: &Path, id: &str) {
+    let journal_dir = dir.join("data/omaread/journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    std::fs::write(
+        journal_dir.join("journal-test.jsonl"),
+        format!(
+            "{{\"at\":\"2020-01-01T00:00:00Z\",\"book\":\"{id}\",\
+             \"type\":\"position_set\",\"href\":\"OEBPS/ch1.xhtml\",\"block\":2,\"offset\":1}}\n"
+        ),
+    )
+    .unwrap();
 }
 
 #[test]
-fn the_scan_list_show_set_forget_round_trip() {
-    let dir = scratch("round-trip");
-    let file = dir.join("books/anathem.epub");
-    book(
-        &file,
-        "Anathem",
-        &["first chapter text", "second chapter text"],
-    );
-    let id = id_of(&file);
-
+fn an_empty_shelf_points_at_the_scan_that_fills_it() {
     // Nothing has been scanned: the empty shelf points at the scan that fills
     // it rather than at a flag the command no longer has.
+    let dir = scratch("empty-shelf");
     let out = omaread(&dir).arg("list").output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("omaread scan"), "{}", stdout(&out));
+}
 
-    // scan → list: one file scanned is one book, counted in the singular.
-    let out = omaread(&dir).args(["scan", "books"]).output().unwrap();
-    assert!(out.status.success(), "{}", stderr(&out));
+#[test]
+fn one_file_scanned_is_one_book_counted_in_the_singular() {
+    let (dir, _id) = a_scanned_library("one-book");
     let out = omaread(&dir).arg("list").output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).starts_with("1 book\n"), "{}", stdout(&out));
     assert!(!stdout(&out).contains("1 books"), "{}", stdout(&out));
+}
 
-    // show: by the file itself, before anything was set by hand.
+#[test]
+fn show_answers_from_the_file_before_anything_is_set_by_hand() {
+    let (dir, _id) = a_scanned_library("show-by-path");
+    let file = dir.join("books/anathem.epub");
     let out = omaread(&dir).arg("show").arg(&file).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("Anathem"), "{}", stdout(&out));
+}
 
-    // set: a correction the file cannot make, which `show` then answers.
+#[test]
+fn a_set_correction_is_shown_by_name_by_id_prefix_and_in_the_json_list() {
+    let (dir, id) = a_scanned_library("set-show");
     let out = omaread(&dir)
         .args([
             "set",
@@ -211,12 +175,13 @@ fn the_scan_list_show_set_forget_round_trip() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
+    // A correction the file cannot make, which `show` then answers — by the
+    // new name and by a prefix of the id.
     for reference in ["Other", &id[..12]] {
         let out = omaread(&dir).arg("show").arg(reference).output().unwrap();
         assert!(out.status.success(), "{reference}: {}", stderr(&out));
-        assert!(stdout(&out).contains("Other"), "{reference}: {out:?}",);
+        assert!(stdout(&out).contains("Other"), "{reference}: {out:?}");
     }
-
     // The record the whole library is listed from carries the same answer.
     let out = omaread(&dir).args(["list", "--json"]).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
@@ -228,26 +193,24 @@ fn the_scan_list_show_set_forget_round_trip() {
         .as_str()
         .unwrap()
         .ends_with("anathem.epub"));
+}
 
-    // Where the reader stopped belongs to the record, and travels with it.
-    let journal_dir = dir.join("data/omaread/journal");
-    std::fs::create_dir_all(&journal_dir).unwrap();
-    std::fs::write(
-        journal_dir.join("journal-test.jsonl"),
-        format!(
-            "{{\"at\":\"2020-01-01T00:00:00Z\",\"book\":\"{id}\",\
-             \"type\":\"position_set\",\"href\":\"OEBPS/ch1.xhtml\",\"block\":2,\"offset\":1}}\n"
-        ),
-    )
-    .unwrap();
+#[test]
+fn the_reading_position_travels_with_the_record() {
+    let (dir, id) = a_scanned_library("position");
+    a_recorded_position(&dir, &id);
     let out = omaread(&dir).args(["list", "--json"]).output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
     let books: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(books[0]["position"]["href"], "OEBPS/ch1.xhtml");
     assert_eq!(books[0]["position"]["block"], 2);
+}
 
-    // forget: the book goes, and the reading position goes with it — a scan
-    // afterwards brings back a book with nothing recorded.
-    let out = omaread(&dir).args(["forget", "Other"]).output().unwrap();
+#[test]
+fn forget_takes_the_book_and_the_scan_brings_back_nothing() {
+    let (dir, id) = a_scanned_library("forget");
+    a_recorded_position(&dir, &id);
+    let out = omaread(&dir).args(["forget", "Anathem"]).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     let out = omaread(&dir).args(["scan", "books"]).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
@@ -331,25 +294,7 @@ fn inspect_reports_what_it_found_for_pictures() {
     // cover draws small needs to see whether the book ever named one.
     let dir = scratch("inspect-pictures");
     let file = dir.join("fixed.epub");
-    std::fs::create_dir_all(&dir).unwrap();
-    let archive = zip::ZipWriter::new(std::fs::File::create(&file).unwrap());
-    let mut zip = archive;
-    let options = zip::write::SimpleFileOptions::default();
-
-    zip.start_file("mimetype", options).unwrap();
-    zip.write_all(b"application/epub+zip").unwrap();
-    zip.start_file("META-INF/container.xml", options).unwrap();
-    zip.write_all(
-        br#"<?xml version="1.0"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
-</container>"#,
-    )
-    .unwrap();
-    zip.start_file("OEBPS/content.opf", options).unwrap();
-    write!(
-        zip,
-        r#"<?xml version="1.0"?>
+    let opf = r#"<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" xmlns:rendition="http://www.idpf.org/2007/ops"
          version="3.0" unique-identifier="id" rendition:layout="pre-paginated">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -360,18 +305,19 @@ fn inspect_reports_what_it_found_for_pictures() {
 <item id="c0" href="ch0.xhtml" media-type="application/xhtml+xml"/>
 <item id="cv" href="cover.png" media-type="image/png" properties="cover-image"/>
 </manifest>
-<spine><itemref idref="c0"/></spine></package>"#
-    )
-    .unwrap();
-    zip.start_file("OEBPS/ch0.xhtml", options).unwrap();
-    write!(
-        zip,
-        r#"<?xml version="1.0"?>
-<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head>
-<body><p>a panel</p></body></html>"#
-    )
-    .unwrap();
-    zip.finish().unwrap();
+<spine><itemref idref="c0"/></spine></package>"#;
+    place(
+        &file,
+        testkit::book_with(
+            "inspect-fixed",
+            "Fixed",
+            &[r#"<p>a panel</p>"#],
+            &[
+                ("mimetype", b"application/epub+zip"),
+                ("OEBPS/content.opf", opf.as_bytes()),
+            ],
+        ),
+    );
 
     let out = omaread(&dir).arg("inspect").arg(&file).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
@@ -397,35 +343,7 @@ fn inspect_reports_what_it_found_for_pictures() {
 /// A book with two pictures in its first chapter: a 1×1 pixel named the
 /// cover, and a diagram in the flow of text.
 fn book_with_pictures(path: &Path) {
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
-    let options = zip::write::SimpleFileOptions::default();
-
-    fn png(width: u32, height: u32) -> Vec<u8> {
-        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            width,
-            height,
-            image::Rgba([200, 100, 50, 255]),
-        ));
-        let mut bytes = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
-        bytes.into_inner()
-    }
-
-    zip.start_file("mimetype", options).unwrap();
-    zip.write_all(b"application/epub+zip").unwrap();
-    zip.start_file("META-INF/container.xml", options).unwrap();
-    zip.write_all(
-        br#"<?xml version="1.0"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
-</container>"#,
-    )
-    .unwrap();
-    zip.start_file("OEBPS/content.opf", options).unwrap();
-    write!(
-        zip,
-        r#"<?xml version="1.0"?>
+    let opf = r#"<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
 <dc:title>Pictures</dc:title><dc:language>en</dc:language>
@@ -436,22 +354,23 @@ fn book_with_pictures(path: &Path) {
 <item id="cv" href="cover.png" media-type="image/png" properties="cover-image"/>
 <item id="art" href="art.png" media-type="image/png"/>
 </manifest>
-<spine><itemref idref="c0"/></spine></package>"#
-    )
-    .unwrap();
-    zip.start_file("OEBPS/ch0.xhtml", options).unwrap();
-    write!(
-        zip,
-        r#"<?xml version="1.0"?>
-<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head>
-<body><img src="cover.png" alt="cover"/><p>a diagram follows</p><img src="art.png" alt="art"/></body></html>"#
-    )
-    .unwrap();
-    zip.start_file("OEBPS/cover.png", options).unwrap();
-    zip.write_all(&png(1, 1)).unwrap();
-    zip.start_file("OEBPS/art.png", options).unwrap();
-    zip.write_all(&png(100, 50)).unwrap();
-    zip.finish().unwrap();
+<spine><itemref idref="c0"/></spine></package>"#;
+    place(
+        path,
+        testkit::book_with(
+            "cli-pictures",
+            "Pictures",
+            &[
+                r#"<img src="cover.png" alt="cover"/><p>a diagram follows</p><img src="art.png" alt="art"/>"#,
+            ],
+            &[
+                ("mimetype", b"application/epub+zip"),
+                ("OEBPS/content.opf", opf.as_bytes()),
+                ("OEBPS/cover.png", &testkit::png(1, 1, [200, 100, 50, 255])),
+                ("OEBPS/art.png", &testkit::png(100, 50, [200, 100, 50, 255])),
+            ],
+        ),
+    );
 }
 
 #[test]
@@ -473,23 +392,17 @@ fn images_reports_each_picture_and_its_own_size() {
     assert!(!text.contains("fill("), "no rule column either: {text}");
 }
 
-#[test]
-fn the_xdg_variables_decide_where_every_file_goes() {
-    // One environment decides every path the program touches. Each variable
-    // names a directory of its own, and every file — the settings, the
-    // journal, the theme template — must land under the variable that names
-    // it, not under the home directory where this machine's real files live.
-    let dir = scratch("xdg");
-
-    // Omarchy only gets a template where Omarchy is installed, and an
-    // `omarchy` directory beside the settings is how that shows.
+/// A scratch installation where Omarchy is installed — an `omarchy` directory
+/// beside the settings is how that shows — and the theme applier is stood in
+/// for: it writes down the name it was handed, so a test sees which file
+/// named the theme.
+fn omarchy_scratch(name: &str) -> (Scratch, PathBuf) {
+    let dir = scratch(name);
     std::fs::create_dir_all(dir.join("config/omarchy")).unwrap();
     // Where this Omarchy release records the current theme: the state
     // directory, per XDG_STATE_HOME.
     std::fs::create_dir_all(dir.join("state/omarchy/current")).unwrap();
     std::fs::write(dir.join("state/omarchy/current/theme.name"), "testtheme\n").unwrap();
-    // The theme applier, stood in for. The name it is handed is how this test
-    // sees which file named the theme.
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let answer = dir.join("theme-applied");
@@ -500,25 +413,37 @@ fn the_xdg_variables_decide_where_every_file_goes() {
     )
     .unwrap();
     std::fs::set_permissions(&applier, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, answer)
+}
 
-    // The settings file and the template are written by the first start, which
-    // only runs once the program owns a terminal — and a test has none to
-    // give. `script` hands the binary a pty; with an empty library the reader
-    // leaves again at once.
+/// The program's first start, on the terminal `script` provides: the settings
+/// file and the template are written only once the program owns one, and a
+/// test has none to give.
+fn first_start(dir: &Path) {
     let binary = format!("'{}'", env!("CARGO_BIN_EXE_omaread"));
     let mut terminal = Command::new("script");
     terminal.args(["-qec", &binary, "/dev/null"]);
-    scratch_env(&mut terminal, &dir);
+    scratch_env(&mut terminal, dir);
     terminal.env(
         "PATH",
-        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap()),
     );
     let out = terminal.output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[test]
+fn the_first_start_writes_every_file_under_the_xdg_variable_that_names_it() {
+    // One environment decides every path the program touches. Each variable
+    // names a directory of its own, and every file the first start writes —
+    // the settings, the theme template — must land under the variable that
+    // names it, not under the home directory where this machine's real files
+    // live.
+    let (dir, answer) = omarchy_scratch("xdg-config");
+    first_start(&dir);
 
     // The settings file, under XDG_CONFIG_HOME, and its commented default
-    // journal naming the directory under XDG_DATA_HOME. Both exist, so the
-    // first start ran.
+    // journal naming the directory under XDG_DATA_HOME.
     let config = dir.join("config/omaread/config.toml");
     let text = std::fs::read_to_string(&config).expect("the settings file follows XDG_CONFIG_HOME");
     assert!(
@@ -541,8 +466,13 @@ fn the_xdg_variables_decide_where_every_file_goes() {
             .trim(),
         "testtheme"
     );
+}
 
-    // A scan writes the journal under XDG_DATA_HOME, the single local log.
+#[test]
+fn a_scan_writes_its_journal_under_xdg_data_home() {
+    // The journal is the program's own data: a scan writes the single local
+    // log under XDG_DATA_HOME.
+    let dir = scratch("xdg-data");
     let file = dir.join("books/one.epub");
     book(&file, "One", &["first chapter text"]);
     let out = omaread(&dir).args(["scan", "books"]).output().unwrap();
@@ -643,7 +573,7 @@ fn the_author_names_can_be_read_and_corrected_in_bulk() {
 
     // A name holding a comma survives the JSON list form: it is one author,
     // where `authors=Le Guin, Ursula` would have been read as two.
-    let id = id_of(&dir.join("books/one.epub"));
+    let id = testkit::id_of(&dir.join("books/one.epub"));
     let out = omaread(&dir)
         .args(["set", &id[..12], r#"authors=["Le Guin, Ursula"]"#, "--json"])
         .output()

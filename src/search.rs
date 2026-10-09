@@ -59,10 +59,17 @@ impl Search {
         *self = Self::default();
     }
 
+    /// Takes over matches the reader already found, without reading the
+    /// chapter again. `n` scans the chapter it is about to open — it has to
+    /// know a match is in there before moving — and hands its finds in here.
+    pub fn adopt(&mut self, hits: Vec<Hit>) {
+        self.hits = hits;
+        self.current = None;
+    }
+
     /// Re-runs the search over a chapter, keeping the query.
     pub fn scan(&mut self, chapter: &Chapter) {
-        self.hits = find_all(chapter, &self.query);
-        self.current = None;
+        self.adopt(find_all(chapter, &self.query));
     }
 
     /// Selects the first match at or after a position. Returns whether one was
@@ -125,38 +132,52 @@ impl Search {
 
 /// Every match of `needle` in a chapter, in reading order.
 ///
-/// Matching is case-insensitive. Comparing lowercased strings can shift offsets
-/// for characters whose lowercase form has a different length, so the search runs
-/// over lowercased characters rather than over a lowercased string.
+/// Matching is case-insensitive. Offsets are character positions inside the
+/// block, so the text and the query each fold one character into exactly one
+/// lowercase character: a fold that widened — as `İ`'s does — would push every
+/// offset after it off the character it names. The runs are walked as they
+/// stand, so a block costs no copy of its own text to be searched.
 pub fn find_all(chapter: &Chapter, needle: &str) -> Vec<Hit> {
     if needle.is_empty() {
         return Vec::new();
     }
-    let needle: Vec<char> = needle.chars().flat_map(|c| c.to_lowercase()).collect();
+    let needle: Vec<char> = needle.chars().map(folded).collect();
     let mut hits = Vec::new();
+    // The one attempt in flight: the folded characters read so far, starting
+    // at the block's character `at`. It never holds more than the query.
+    let mut window: Vec<char> = Vec::with_capacity(needle.len());
 
     for (index, block) in chapter.blocks.iter().enumerate() {
-        let text: Vec<char> = block
-            .plain_text()
-            .chars()
-            .flat_map(|c| c.to_lowercase())
-            .collect();
-        if text.len() < needle.len() {
-            continue;
-        }
-        // Overlapping matches are not reported twice: the search steps past a
-        // match, as a reader would expect from `n`.
+        window.clear();
         let mut at = 0;
-        while at + needle.len() <= text.len() {
-            if text[at..at + needle.len()] == needle[..] {
+        for ch in block
+            .runs
+            .iter()
+            .flat_map(|run| run.text.chars())
+            .map(folded)
+        {
+            window.push(ch);
+            if window.len() < needle.len() {
+                continue;
+            }
+            // Overlapping matches are not reported twice: the search steps past a
+            // match, as a reader would expect from `n`.
+            if window[..] == needle[..] {
                 hits.push((index, at));
                 at += needle.len();
+                window.clear();
             } else {
                 at += 1;
+                window.remove(0);
             }
         }
     }
     hits
+}
+
+/// One lowercase character for one character of the text, on both sides.
+fn folded(ch: char) -> char {
+    ch.to_lowercase().next().unwrap_or(ch)
 }
 
 #[cfg(test)]
@@ -191,13 +212,23 @@ mod tests {
         let texts = chapter(&["The Phoenix Framework"]);
         assert_eq!(find_all(&texts, "phoenix"), vec![(0, 4)]);
         assert_eq!(find_all(&texts, "PHOENIX"), vec![(0, 4)]);
-        assert_eq!(find_all(&chapter(&["aaaa"]), "aa"), vec![(0, 0), (0, 2)]);
+        let texts = chapter(&["aaaa"]);
+        assert_eq!(find_all(&texts, "aa"), vec![(0, 0), (0, 2)]);
+        // Nothing to look for finds nothing, and neither does a word the text
+        // does not hold.
+        let texts = chapter(&["text"]);
+        assert!(find_all(&texts, "").is_empty());
+        assert!(find_all(&texts, "abc").is_empty());
     }
 
     #[test]
-    fn a_query_that_cannot_match_reports_nothing() {
-        assert!(find_all(&chapter(&["text"]), "").is_empty());
-        assert!(find_all(&chapter(&["ab"]), "abc").is_empty());
+    fn a_character_that_folds_wider_still_counts_as_one() {
+        // 'İ' lowercases to two characters. Folding it to one keeps every
+        // offset after it on the character the reader sees: the 'cat' of
+        // "İcat" starts right after the İ.
+        assert_eq!(find_all(&chapter(&["İcat"]), "cat"), vec![(0, 1)]);
+        // The query folds by the same rule, so what is typed is what is found.
+        assert_eq!(find_all(&chapter(&["icat"]), "İ"), vec![(0, 0)]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "omaread"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 license = "MIT"
 description = "A small terminal EPUB reader: a library, reading positions and pictures"
@@ -9,14 +9,20 @@ repository = "https://github.com/77-223255/omaread"
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"
-chrono = { version = "0.4.45", features = ["serde"] }
-clap = { version = "4.6.6", features = ["derive"] }
-crossterm = "0.29.0"
+# `now` rather than `clock`: only Utc::now() needs the wall clock, and `clock`
+# pulls in iana-time-zone and winapi for a local zone nothing reads.
+chrono = { version = "0.4.45", default-features = false, features = ["std", "now", "serde"] }
+clap = { version = "4.6.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 dirs = "6.0.0"
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif"] }
 libc = "0.2.189"
-ratatui = { version = "0.30.2", features = ["underline-color"] }
-roxmltree = "0.21.1"
+# `scrolling-regions`: a one-row scroll is sent as a scroll escape and the row
+# it exposes, rather than the whole screen's worth of cells. See the
+# `Presenter` in session.rs.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "scrolling-regions"] }
+# No `positions`: nothing calls Node::position()/range(), and the byte offsets
+# they record cost space in every parsed document.
+roxmltree = { version = "0.21.1", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
@@ -25,13 +31,35 @@ unicode-width = "0.2.2"
 # EPUB permits stored and deflated entries only, so the other compressors are
 # left out. They pull in C libraries, which would otherwise force a C toolchain
 # on anyone building the reader and stand in the way of a static binary.
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 
 # The reader ships as one binary, and a smaller one is a smaller download and
 # less to page in. Symbol names are no use on a machine that is not going to
 # debug it, LTO folds the duplicated generic instantiations the image decoders
 # produce, and nothing unwinds: a panic is a crash either way, and unwinding
 # tables cost about 8% of the file for a path no one takes.
+# The whole dependency tree compiles for size, except the hot path: the
+# image decoders, the frame's own diffing and base64. Those are what a slow
+# machine feels, and "z" costs them half again as much time -- measured on a
+# 1600x1200 PNG, decoding took 20 ms at opt-level 3 and 41 ms at "z". The
+# rest of the tree (clap, serde, roxmltree, the writers) keeps the smaller
+# build, which is worth about 165 KB.
+[profile.release.package."*"]
+opt-level = "z"
+
+[profile.release.package.image]
+opt-level = 3
+[profile.release.package.png]
+opt-level = 3
+[profile.release.package.miniz_oxide]
+opt-level = 3
+[profile.release.package.ratatui]
+opt-level = 3
+[profile.release.package.zune-jpeg]
+opt-level = 3
+[profile.release.package.base64]
+opt-level = 3
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

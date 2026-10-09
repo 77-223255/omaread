@@ -110,7 +110,8 @@ fn try_qmd(query: &str, state: &State, limit: usize) -> Option<Vec<Hit>> {
         };
         let chapter_title = strip_book_prefix(&hit.title, &record.display_title());
         let mut snippet = tidy(&hit.snippet);
-        let passage = passage_of(&hit.snippet).or_else(|| line.and_then(|l| line_text(&path, l)));
+        let passage =
+            passage_of(&hit.snippet).or_else(|| line.and_then(|l| export::line_text(&path, l)));
         // The match sat in the front matter, so the file holds the text to show.
         if snippet.is_empty() {
             snippet = first_prose(&path).unwrap_or_else(|| chapter_title.clone());
@@ -207,18 +208,6 @@ fn first_prose(path: &std::path::Path) -> Option<String> {
     Some(line.to_string())
 }
 
-fn line_text(path: &std::path::Path, line: usize) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let raw = text.lines().nth(line.saturating_sub(1))?.trim();
-    let cleaned = raw.trim_start_matches(['#', '>', '-', '*', ' ']).trim();
-    let words: Vec<&str> = cleaned.split_whitespace().take(8).collect();
-    if words.len() < 2 {
-        None
-    } else {
-        Some(words.join(" "))
-    }
-}
-
 /// Reduces a snippet to one line of book text for the list.
 fn tidy(snippet: &str) -> String {
     let body: Vec<&str> = snippet
@@ -242,8 +231,9 @@ fn search_directly(
     report: &mut dyn FnMut(&str),
 ) -> Result<Vec<Hit>> {
     let mut entries = library::entries(state);
-    // Title order, so a search reads the same way twice.
-    library::sort(&mut entries, library::Order::Title);
+    // One fixed order, so a search reads the same way twice: author then
+    // title, the order the whole library is listed in everywhere else.
+    library::sort_books(&mut entries);
 
     let mut hits = Vec::new();
     for entry in entries {
@@ -268,11 +258,7 @@ fn search_directly(
             if found.is_empty() {
                 continue;
             }
-            let chapter_title = book
-                .spine
-                .get(index)
-                .and_then(|item| item.title.clone())
-                .unwrap_or_else(|| format!("Chapter {}", index + 1));
+            let chapter_title = book.chapter_title(index);
 
             // One hit per chapter: a list of forty hits from one chapter would
             // bury the other books.

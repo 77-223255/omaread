@@ -9,16 +9,8 @@
 use super::mathml;
 use crate::doc::{Block, BlockKind, Link, RunBuilder, RunStyle};
 use anyhow::{Context, Result};
-use roxmltree::{Document, Node, ParsingOptions};
-
-/// Chapter documents carry a doctype and, in EPUB 2, an internal entity subset.
-/// Both are refused by default, so parsing must allow DTDs explicitly.
-pub fn parsing_options<'input>() -> ParsingOptions<'input> {
-    ParsingOptions {
-        allow_dtd: true,
-        ..ParsingOptions::default()
-    }
-}
+use roxmltree::{Document, Node};
+use std::borrow::Cow;
 
 /// Elements whose content never reaches the reader.
 const SKIPPED: &[&str] = &["head", "script", "style", "title", "template"];
@@ -84,8 +76,8 @@ pub fn parse(xml: &str) -> Result<Vec<Block>> {
 /// Parses a chapter that lives at `base` inside the container, so image paths
 /// can be resolved relative to it.
 pub fn parse_in(xml: &str, base: &str) -> Result<Parsed> {
-    let cleaned = resolve_named_entities(xml);
-    let doc = Document::parse_with_options(&cleaned, parsing_options())
+    let cleaned = crate::epub::xml::clean(xml);
+    let doc = Document::parse_with_options(&cleaned, crate::epub::xml::options())
         .context("chapter is not well-formed XML")?;
 
     let mut walker = Walker {
@@ -458,83 +450,66 @@ pub(super) fn collect_raw_text(node: Node) -> String {
 /// Zero-width spaces are used as line anchors in some books. They are invisible,
 /// yet they keep a block from counting as empty, which would leave a stray blank
 /// line between every line of a listing.
-fn strip_invisibles(text: &str) -> String {
-    text.chars()
-        .filter(|c| !matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}'))
-        .filter(|c| *c != '\r')
-        .collect()
+///
+/// Text holding none of them comes back as it stands, with no copy made.
+fn strip_invisibles(text: &str) -> Cow<'_, str> {
+    clean(text, false)
 }
 
 /// Collapses runs of whitespace into single spaces, as HTML rendering does.
 ///
 /// Only ASCII whitespace collapses. A no-break space is content: it must stay a
 /// distinct character so the line breaker does not split there.
-pub(super) fn collapse_whitespace(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+///
+/// Most text nodes are already clean — nothing to strip, no run to collapse —
+/// and those come back borrowed; copying them twice apiece was the whole cost
+/// of cleaning a chapter.
+pub(super) fn collapse_whitespace(text: &str) -> Cow<'_, str> {
+    clean(text, true)
+}
+
+/// The one pass behind both: marks that never show are dropped, and — when
+/// `collapse` — runs of ASCII whitespace become single spaces. The input is
+/// returned as it stands for as long as the output would be byte-for-byte the
+/// same, so the copy starts only at the first character that differs.
+fn clean(text: &str, collapse: bool) -> Cow<'_, str> {
+    let mut out: Option<String> = None;
+    // Whether what has been written so far ends in the space a run collapsed to.
     let mut in_space = false;
-    for ch in strip_invisibles(text).chars() {
-        if ch.is_ascii_whitespace() {
-            if !in_space {
-                out.push(' ');
-                in_space = true;
+    for (at, ch) in text.char_indices() {
+        if matches!(ch, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}' | '\r') {
+            // Nothing before this mark needs rewording, so the copy starts with
+            // the text exactly as written up to here — and the mark is left out.
+            out.get_or_insert_with(|| text[..at].to_owned());
+            continue;
+        }
+        if collapse && ch.is_ascii_whitespace() {
+            if in_space {
+                // Second character of a run: the run's one space already stands,
+                // so this one drops out of the output.
+                out.get_or_insert_with(|| text[..at].to_owned());
+                continue;
             }
-        } else {
-            out.push(ch);
-            in_space = false;
+            if ch == ' ' && out.is_none() {
+                // A lone space reads the same collapsed: nothing has changed,
+                // and whether it ever will is for the next character to say.
+                in_space = true;
+                continue;
+            }
+            out.get_or_insert_with(|| text[..at].to_owned()).push(' ');
+            in_space = true;
+            continue;
         }
-    }
-    out
-}
-
-/// Replaces named HTML entities that XML does not define. Entities declared in a
-/// document's own internal subset are left to the parser; this only covers the
-/// common ones that EPUB files use without declaring them.
-fn resolve_named_entities(xml: &str) -> String {
-    let mut out = xml.to_string();
-    for (entity, replacement) in ENTITIES {
-        if out.contains(entity) {
-            out = out.replace(entity, replacement);
+        if let Some(written) = out.as_mut() {
+            written.push(ch);
         }
+        in_space = false;
     }
-    out
+    match out {
+        Some(written) => Cow::Owned(written),
+        None => Cow::Borrowed(text),
+    }
 }
-
-/// Named entities that appear in EPUB content but are not predefined in XML.
-/// `&amp;`, `&lt;`, `&gt;`, `&quot;` and `&apos;` are left to the parser.
-const ENTITIES: &[(&str, &str)] = &[
-    ("&nbsp;", "\u{00a0}"),
-    ("&ndash;", "\u{2013}"),
-    ("&mdash;", "\u{2014}"),
-    ("&lsquo;", "\u{2018}"),
-    ("&rsquo;", "\u{2019}"),
-    ("&ldquo;", "\u{201c}"),
-    ("&rdquo;", "\u{201d}"),
-    ("&hellip;", "\u{2026}"),
-    ("&copy;", "\u{00a9}"),
-    ("&reg;", "\u{00ae}"),
-    ("&trade;", "\u{2122}"),
-    ("&deg;", "\u{00b0}"),
-    ("&middot;", "\u{00b7}"),
-    ("&bull;", "\u{2022}"),
-    ("&dagger;", "\u{2020}"),
-    ("&eacute;", "\u{00e9}"),
-    ("&egrave;", "\u{00e8}"),
-    ("&auml;", "\u{00e4}"),
-    ("&ouml;", "\u{00f6}"),
-    ("&uuml;", "\u{00fc}"),
-    ("&Auml;", "\u{00c4}"),
-    ("&Ouml;", "\u{00d6}"),
-    ("&Uuml;", "\u{00dc}"),
-    ("&szlig;", "\u{00df}"),
-    ("&euro;", "\u{20ac}"),
-    ("&pound;", "\u{00a3}"),
-    ("&times;", "\u{00d7}"),
-    ("&frac12;", "\u{00bd}"),
-    ("&thinsp;", "\u{2009}"),
-    ("&shy;", "\u{00ad}"),
-    ("&ensp;", "\u{2002}"),
-    ("&emsp;", "\u{2003}"),
-];
 
 #[cfg(test)]
 mod tests {
@@ -616,6 +591,17 @@ mod tests {
         assert_eq!(blocks[0].plain_text(), "one two three");
         let blocks = parse("<html><body><p>a&nbsp;b &mdash; c</p></body></html>").unwrap();
         assert_eq!(blocks[0].plain_text(), "a\u{00a0}b \u{2014} c");
+    }
+
+    #[test]
+    fn cleaning_changes_only_what_it_always_changed() {
+        // Where the text changes, it changes exactly what it always did: runs
+        // collapse to one space, marks and carriage returns go.
+        assert_eq!(&*collapse_whitespace("a  b\tc\nd"), "a b c d");
+        assert_eq!(&*collapse_whitespace(" \u{200b}\r\nnext"), " next");
+        assert_eq!(&*strip_invisibles("one\r\ntwo\u{feff}"), "one\ntwo");
+        // A no-break space is content, not whitespace to collapse.
+        assert_eq!(&*collapse_whitespace("a\u{00a0}  b"), "a\u{00a0} b");
     }
 
     #[test]

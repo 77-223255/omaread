@@ -116,19 +116,25 @@ pub struct Locator {
 #[derive(Default)]
 pub struct RunBuilder {
     runs: Vec<Run>,
+    /// Characters pushed so far, kept as they are pushed: a link or an id
+    /// asks for the count while the block is still being built, and summing
+    /// every run's characters on each question made asking as dear as
+    /// reading the chapter again.
+    chars: usize,
 }
 
 impl RunBuilder {
     /// Characters collected so far. Links are recorded as ranges into the block
     /// being built, so they need this while it is still open.
     pub fn char_count(&self) -> usize {
-        self.runs.iter().map(|r| r.text.chars().count()).sum()
+        self.chars
     }
 
     pub fn push(&mut self, text: &str, style: RunStyle) {
         if text.is_empty() {
             return;
         }
+        self.chars += text.chars().count();
         match self.runs.last_mut() {
             Some(last) if last.style == style => last.text.push_str(text),
             _ => self.runs.push(Run {
@@ -161,4 +167,21 @@ impl RunBuilder {
         self.runs.retain(|r| !r.text.is_empty());
         self.runs
     }
+}
+
+/// Whether a character belongs to a script that writes without spaces between
+/// words: Han, the Japanese kana, the Korean syllables, and the punctuation
+/// that goes with them. Both the reader and the layout need the answer — one
+/// to join text across a hidden mark, the other to let a line end between two
+/// such characters.
+pub fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2E80..=0x303F | 0x3040..=0x30FF | 0x3100..=0x312F | 0x31C0..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFFEF
+            | 0x20000..=0x3FFFF
+    )
 }

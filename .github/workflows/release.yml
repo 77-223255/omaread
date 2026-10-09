@@ -35,12 +35,22 @@ jobs:
         run: cargo test --target "$TARGET"
 
       - name: Build
-        run: cargo build --release --target "$TARGET"
+        # Without this the build directory and the cargo registry land in
+        # .rodata (panic messages, source locations), which pins the binary to
+        # the machine that made it and to paths nobody reads. Remapped to "."
+        # the strings shrink with them. It is shell, so $PWD and $HOME expand.
+        run: |
+          RUSTFLAGS="--remap-path-prefix=$PWD=. --remap-path-prefix=$HOME/.cargo/registry/src/=." \
+            cargo build --release --target "$TARGET"
 
       - name: Package
         run: |
           binary="target/$TARGET/release/omaread"
           strip "$binary"
+          # strip=symbols leaves the unwind tables in place, and the profile is
+          # panic=abort, so there is no unwinder to serve: dropping them is
+          # about 8% of the file for code that can never run.
+          objcopy --remove-section=.eh_frame --remove-section=.eh_frame_hdr --remove-section=.gcc_except_table "$binary"
           # Refuse to ship something that pulls in libraries at startup. The
           # loader is asked rather than file(1), which calls the same binary
           # "static-pie linked" and would not match.

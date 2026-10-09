@@ -32,8 +32,13 @@ impl BookId {
         let digest = hasher.finalize();
         let mut hex = String::with_capacity(7 + digest.len() * 2);
         hex.push_str("sha256:");
+        // A nibble at a time through a table: an id is built once per file a
+        // scan opens, and formatting each byte would build and copy a fresh
+        // two-character string for every one of them.
+        const HEX: &[u8; 16] = b"0123456789abcdef";
         for byte in digest {
-            hex.push_str(&format!("{byte:02x}"));
+            hex.push(HEX[(byte >> 4) as usize] as char);
+            hex.push(HEX[(byte & 0x0f) as usize] as char);
         }
         Ok(Self(hex))
     }

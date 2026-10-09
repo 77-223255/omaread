@@ -73,6 +73,15 @@ static ZH: &[(&str, &str)] = &[
         "cursor mode: Enter follows a link, i leaves",
         "光标模式：Enter 跟随链接，i 退出",
     ),
+    (
+        "vision mode: move, y copies, Esc leaves",
+        "vision 模式：移动光标，y 复制，Esc 退出",
+    ),
+    ("start a selection", "开始选择"),
+    ("copy the selection", "复制所选内容"),
+    ("leave vision", "退出 vision"),
+    ("nothing to copy", "没有可复制的内容"),
+    ("copied {} characters", "已复制 {} 个字符"),
     ("search cleared", "已清除搜索"),
     ("no link here", "此处没有链接"),
     ("nowhere to go back to", "没有可返回的位置"),
@@ -95,12 +104,19 @@ static ZH: &[(&str, &str)] = &[
     (" Keys - any key closes ", " 按键 - 任意键关闭 "),
     ("Library", "书库"),
     ("Enter opens  ·  q leaves", "Enter 打开  ·  q 离开"),
-    ("by {}  ·  ? for keys", "按{}  ·  ? 查按键"),
-    ("{} books", "{} 本书"),
-    ("{} book", "{} 本书"),
-    ("{} of {} books  ·  filter {}", "{} / {} 本书  ·  筛选 {}"),
-    ("{} of {} book  ·  filter {}", "{} / {} 本书  ·  筛选 {}"),
-    ("sorted by {}", "已按{}排序"),
+    ("{}  ·  ? for keys", "{}  ·  ? 查按键"),
+    ("authors", "作者列表"),
+    ("books", "书目"),
+    ("no author", "无作者"),
+    ("{} authors", "{} 位作者"),
+    ("{} author", "{} 位作者"),
+    ("{} of {} authors  ·  filter {}", "{} / {} 位作者  ·  筛选 {}"),
+    ("{} of {} author  ·  filter {}", "{} / {} 位作者  ·  筛选 {}"),
+    ("{}  ·  {} books", "{}  ·  {} 本书"),
+    ("{}  ·  {} book", "{}  ·  {} 本书"),
+    ("{}  ·  {} of {} books  ·  filter {}", "{}  ·  {} / {} 本书  ·  筛选 {}"),
+    ("{}  ·  {} of {} book  ·  filter {}", "{}  ·  {} / {} 本书  ·  筛选 {}"),
+    ("no author matches {}", "没有匹配的作者：{}"),
     ("no book matches {}", "没有匹配的书：{}"),
     ("  no book matches {}", "  没有匹配的书：{}"),
     ("file is gone: {}", "文件不存在：{}"),
@@ -111,16 +127,12 @@ static ZH: &[(&str, &str)] = &[
         "按标题、作者、系列或标签筛选",
     ),
     ("filter cleared", "已清除筛选"),
-    ("clear the filter", "清除筛选"),
-    ("open the book", "打开这本书"),
-    ("cycle the order: title, author", "切换排序：标题、作者"),
+    ("back to the authors, clear the filter", "返回作者 / 清除过滤"),
+    ("enter the author, open the book", "进入作者 / 打开"),
     ("down, up", "下、上"),
     ("first, last", "首、尾"),
     ("page down, up", "翻页下、上"),
     ("quit", "退出"),
-    ("title", "标题"),
-    ("author", "作者"),
-    ("series", "系列"),
     ("{} hits for {}  ·  {}", "{} 条结果：{}  ·  {}"),
     ("{} hit for {}  ·  {}", "{} 条结果：{}  ·  {}"),
     ("qmd index", "qmd 索引"),
@@ -255,7 +267,11 @@ mod tests {
     fn everything_the_reader_displays_is_in_the_table() {
         let sources = [
             include_str!("app.rs"),
-            include_str!("ui.rs"),
+            include_str!("ui/mod.rs"),
+            include_str!("ui/shelf.rs"),
+            include_str!("ui/hits.rs"),
+            include_str!("library.rs"),
+            include_str!("measure.rs"),
             include_str!("shelf.rs"),
             include_str!("main.rs"),
         ];
@@ -269,12 +285,12 @@ mod tests {
                 }
             }
         }
-        // The order is looked up with a value the source scan cannot see, so it
-        // is checked against the things that produce the values.
-        for order in [crate::library::Order::Title, crate::library::Order::Author] {
+        // The level label is looked up with a value the source scan cannot
+        // see, so it is checked against the things that produce the values.
+        for level in [crate::shelf::Level::Authors, crate::shelf::Level::Books] {
             checked += 1;
-            if translated(order.label()).is_none() {
-                missing.push(order.label().to_string());
+            if translated(level.label()).is_none() {
+                missing.push(level.label().to_string());
             }
         }
         missing.sort();

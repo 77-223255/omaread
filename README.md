@@ -62,6 +62,7 @@ mode, so the ones worth knowing first:
 | `t` `Tab` | table of contents |
 | `/`, `n` `N` | search the book, next / previous hit |
 | `i` | cursor in the text (links, movement) |
+| `v`, `y` | vision mode: select text, copy it to the clipboard |
 | `h` `l` `←` `→` | move the cursor by character |
 | `Enter`, `Ctrl-o` | follow a link, come back |
 | `Esc` | step back: clear the search, leave the cursor, close the contents |
@@ -70,9 +71,11 @@ mode, so the ones worth knowing first:
 | `?` | this key list |
 
 The library takes the same movement keys — `j`/`k` or `↓`/`↑`, `Space` and
-`PgDn` for a page — with `Enter` to open a book, `/` to filter, `s` to cycle
-the order and `Esc` to clear the filter. The mouse works too: a click opens a
-book in the library or a chapter in the contents, and the wheel scrolls.
+`PgDn` for a page — and is two levels deep: the authors alphabetically, then
+one author's books by title. `Enter` (or `l`) steps in — to an author, or to
+reading a book — `Esc` (or `h`) steps back, `/` filters whichever list is
+showing. The mouse works too: a click enters what it lands on, an author or a
+book, and the wheel scrolls.
 
 ## Commands
 
@@ -142,12 +145,9 @@ first start:
 # meant to be shared between machines.
 # journal_dir = "~/.local/share/omaread/journal"
 
-# Reading width in columns. Comment out to use the full window.
-# max_width = 66
-
 # How pictures are drawn. Left out, the terminal is asked and the
-# best of kitty, sixel and half-blocks is used. Inside tmux only
-# half-blocks work, because tmux manages the screen itself.
+# best of kitty, sixel and quad is used. Inside tmux only
+# quad works, because tmux manages the screen itself.
 # images = "sixel"
 ```
 
@@ -180,11 +180,26 @@ the single file the first time it is written to, and the old files are removed.
 
 ## Notes
 
-- **Pictures.** A cover and a pre-paginated page fill the room; a picture in
-  the body is magnified up to four times to fill the room; a mark (a small,
-  glyph-sized image) keeps its own size. Pictures are centred, capped at four
-  times their own size in cells, and drawn with kitty or sixel where the
-  terminal supports them, half-blocks everywhere else (and always inside tmux).
+- **Pictures.** Every picture is made of ordinary cells: a character splits
+  into four quadrants, each one pixel of that patch of the image, painted in
+  one of two colours. A cover and a pre-paginated page fill the room; a picture
+  in the body is magnified up to four times to fill the room; a mark (a small,
+  glyph-sized image, such as a footnote's marker) is hidden, so the sentence
+  around it runs on. Pictures are centred and capped at four times their own
+  size in cells. Where the terminal supports it, kitty or sixel paints real
+  pixels instead; quadrants are what every terminal gets, tmux included, and
+  they scroll and redraw with the text.
+- **Vision mode.** `v` puts a selection under the cursor; the movement keys
+  extend it, and `y` copies what is marked with the terminal's own clipboard
+  escape (OSC 52), so it works over ssh too. `Esc` or `v` lets the selection
+  go.
+- **The page.** A hidden cursor holds the reading position: it starts on the
+  first line, scrolling moves it, and the paragraph under it stays at full
+  colour while the rest of the page steps back into the background. The page
+  follows the cursor to keep it in the middle, so the first and the last
+  paragraph of a chapter get their turn like every one between. A reading
+  position is that cursor's own place, so reopening a book puts the line you
+  left off on back in the middle.
 - **Formulas.** MathML is set on one line, with real Unicode super- and
   subscripts where they exist and plain `_x` / `^(x)` where they do not.
 - **Theme.** Colours follow the active Omarchy theme when one is installed,

@@ -27,9 +27,7 @@ const APP: &str = "omaread";
 pub struct Config {
     /// Directory holding the journal. One local file, the source of truth.
     pub journal_dir: Option<PathBuf>,
-    /// Maximum reading width in columns. `None` uses the full window.
-    pub max_width: Option<u16>,
-    /// How to draw pictures: `kitty`, `sixel` or `half-blocks`. `None` asks the
+    /// How to draw pictures: `kitty`, `sixel` or `quad`. `None` asks the
     /// terminal.
     pub images: Option<String>,
 }
@@ -63,12 +61,9 @@ impl Config {
              # not meant to be shared between machines.\n\
              # journal_dir = \"{}\"\n\
              \n\
-             # Reading width in columns. Comment out to use the full window.\n\
-             # max_width = 66\n\
-             \n\
              # How pictures are drawn. Left out, the terminal is asked and the\n\
-             # best of kitty, sixel and half-blocks is used. Inside tmux only\n\
-             # half-blocks work, because tmux manages the screen itself.\n\
+             # best of kitty, sixel and quad is used. Inside tmux only\n\
+             # quad works, because tmux manages the screen itself.\n\
              # images = \"sixel\"\n",
             default_journal.display()
         );
@@ -87,6 +82,15 @@ impl Config {
 
 pub fn config_file() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
+}
+
+/// Where the journal lives, read from the config in one place.
+///
+/// Every command that reads or writes the journal asks here rather than
+/// loading the config itself: one load per run, and `main` carries no path
+/// down into the commands it dispatches to.
+pub fn journal_dir() -> Result<PathBuf> {
+    Config::load()?.journal_dir()
 }
 
 /// The base configuration directory: `XDG_CONFIG_HOME`, else `~/.config`.
@@ -172,12 +176,10 @@ mod tests {
 
     #[test]
     fn settings_are_read_from_toml_and_absent_values_stay_default() {
-        let config: Config = toml::from_str("max_width = 72\njournal_dir = \"~/box\"\n").unwrap();
-        assert_eq!(config.max_width, Some(72));
+        let config: Config = toml::from_str("journal_dir = \"~/box\"\n").unwrap();
         assert_eq!(config.journal_dir, Some(PathBuf::from("~/box")));
 
         let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.max_width, None);
         assert_eq!(config.journal_dir, None);
     }
 

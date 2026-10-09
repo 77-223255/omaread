@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, Permissions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -69,6 +69,16 @@ pub enum Payload {
 }
 
 impl Event {
+    /// The journal line for this event, newline included.
+    ///
+    /// One event is one line, and a line is written whole: a line cut short
+    /// costs the one event it was carrying and never the file around it.
+    fn line(&self) -> Result<String> {
+        let mut line = serde_json::to_string(self)?;
+        line.push('\n');
+        Ok(line)
+    }
+
     /// Whether this event could have been written by this program.
     ///
     /// The journal is a file on disk — possibly in a folder shared between
@@ -234,6 +244,19 @@ impl BookRecord {
             clean(&self.authors.join(", "))
         }
     }
+
+    /// The series the book is in and where in it: "Name 3", the name alone
+    /// when no number is recorded, and nothing at all when there is no
+    /// series. Spelled once, so `show`, `list` and the shelf name the series
+    /// the same way — and not cleaned here, because each of them decides
+    /// what it prints with.
+    pub fn series_label(&self) -> Option<String> {
+        let name = self.series.as_ref()?;
+        Some(match self.series_index {
+            Some(at) => format!("{name} {at}"),
+            None => name.clone(),
+        })
+    }
 }
 
 impl State {
@@ -362,8 +385,17 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
+/// The one file this machine writes, and the one a fold leaves behind. An
+/// older version named a file after each machine instead; those are read
+/// beside it until the next fold absorbs them.
+const JOURNAL_FILE: &str = "journal.jsonl";
+
+/// What a write and a fold in this folder serialise on: a file of their own,
+/// so the lock never rides the journal through the rename a fold does.
+const LOCK_FILE: &str = ".lock";
+
 pub struct Journal {
-    /// This machine's file, named after this machine. The only one written to.
+    /// This machine's log. The only one written to.
     own_file: PathBuf,
     /// Guards a write against a compaction running at the same time.
     lock_file: PathBuf,
@@ -389,14 +421,12 @@ impl Journal {
         // Every journal in the directory, not only the one in use: a
         // `journal-<host>.jsonl` from an older version holds the same reading
         // positions and is private the same way.
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    let _ = std::fs::set_permissions(entry.path(), Permissions::from_mode(0o600));
-                }
+        if let Ok(files) = journal_files(dir) {
+            for path in files {
+                let _ = std::fs::set_permissions(path, Permissions::from_mode(0o600));
             }
         }
-        let own_file = dir.join("journal.jsonl");
+        let own_file = dir.join(JOURNAL_FILE);
         // Before the first write: a folder from an older version holds one
         // `journal-<host>.jsonl` per machine, and the ones here are folded into
         // the single local file. A log that has grown long is folded too, and a
@@ -410,7 +440,7 @@ impl Journal {
         }
         Ok(Self {
             own_file,
-            lock_file: dir.join(".lock"),
+            lock_file: dir.join(LOCK_FILE),
             last_written: None,
         })
     }
@@ -423,41 +453,11 @@ impl Journal {
     /// longer writes, such as the `host` that used to name the machine, is
     /// ignored rather than refused.
     pub fn replay(dir: &Path) -> Result<State> {
-        let mut events = Vec::new();
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            // No directory yet means nothing has been read so far.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
-            Err(err) => return Err(err).with_context(|| format!("cannot read {}", dir.display())),
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Ok(file) = File::open(&path) else {
-                continue;
-            };
-            for line in BufReader::new(file).lines().map_while(Result::ok) {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(event) = serde_json::from_str::<Event>(&line)
-                    && event.is_plausible() {
-                        events.push(event);
-                    }
-            }
-        }
-
-        // Apply in time order so the newest position wins regardless of which
-        // file it came from.
-        events.sort_by_key(|a| a.at);
-        let mut state = State::default();
-        for event in events {
-            state.apply(event);
-        }
-        Ok(state)
+        let events = read_events(dir)?
+            .into_iter()
+            .flat_map(|log| log.events)
+            .collect();
+        Ok(fold(events))
     }
 
     pub fn append(&mut self, book: &BookId, payload: Payload) -> Result<()> {
@@ -466,7 +466,7 @@ impl Journal {
             book: book.as_str().to_string(),
             payload,
         };
-        let line = serde_json::to_string(&event)?;
+        let line = event.line()?;
         // Hold the lock across the open and the write, so a compaction cannot
         // rename the file out from under it and leave the event in an inode
         // nothing reads again.
@@ -482,9 +482,7 @@ impl Journal {
         // interleave *inside* a line, or the file the library is rebuilt from
         // grows lines nobody can read and the events they held are gone without a
         // word. `writeln!` may issue more than one write; this cannot.
-        let mut bytes = line.into_bytes();
-        bytes.push(b'\n');
-        file.write_all(&bytes)?;
+        file.write_all(line.as_bytes())?;
         Ok(())
     }
 
@@ -560,15 +558,25 @@ fn folded_bytes(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Every journal in the folder, under whatever name it carries: today's
+/// single log, or a `journal-<host>.jsonl` an older version left behind.
+///
+/// The scan lives in one place so that reading, reporting and folding cannot
+/// come to differ about which files are journals; an error reading the folder
+/// is returned rather than swallowed, because a folder that is missing says
+/// so differently from one that cannot be opened.
+fn journal_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(dir)?;
+    Ok(entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect())
+}
+
 /// Whether the folder holds any journal at all, under whatever name.
 fn has_journal(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries.flatten().any(|entry| {
-                entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl")
-            })
-        })
-        .unwrap_or(false)
+    journal_files(dir).is_ok_and(|files| !files.is_empty())
 }
 
 /// The events that reproduce `state` and nothing more.
@@ -632,6 +640,72 @@ fn minimal(state: &State) -> Vec<(&BookId, Payload)> {
     out
 }
 
+/// One journal file as it was read: its name, its size, and the events that
+/// could be read out of it.
+struct JournalLog {
+    name: String,
+    bytes: u64,
+    events: Vec<Event>,
+}
+
+/// Every journal in the folder, read and parsed once.
+///
+/// Replaying, reporting and folding each used to walk the folder and parse
+/// every line again — `status` even collected a `String` copy of every line it
+/// read — so one pass over the files answers all three and every count made
+/// from it agrees with the events that actually replay. What is not an event
+/// is not kept: a blank line, or one nothing could parse.
+fn read_events(dir: &Path) -> Result<Vec<JournalLog>> {
+    let files = match journal_files(dir) {
+        Ok(files) => files,
+        // No directory yet means nothing has been read so far.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("cannot read {}", dir.display())),
+    };
+    let mut logs = Vec::new();
+    for path in files {
+        // A file that cannot be read is skipped rather than failing the whole
+        // read: one journal nobody can open must not hide the others.
+        let Ok(raw) = std::fs::read(&path) else {
+            continue;
+        };
+        let bytes = raw.len() as u64;
+        // Bytes that are not UTF-8 are damage like any other: the lines around
+        // them still parse, instead of the rest of the file going unread with
+        // them.
+        let text = String::from_utf8_lossy(&raw);
+        let events = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .collect();
+        logs.push(JournalLog {
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            bytes,
+            events,
+        });
+    }
+    Ok(logs)
+}
+
+/// The state the events add up to, in time order so the newest position wins
+/// regardless of which file each came from.
+///
+/// Events that could not have been written by this program are dropped on the
+/// way in — see [`Event::is_plausible`].
+fn fold(mut events: Vec<Event>) -> State {
+    events.retain(|event| event.is_plausible());
+    events.sort_by_key(|event| event.at);
+    let mut state = State::default();
+    for event in events {
+        state.apply(event);
+    }
+    state
+}
+
 /// Folds the log to the events that still matter.
 ///
 /// The folder is local: every `journal*.jsonl` in it is this machine's, from
@@ -639,9 +713,13 @@ fn minimal(state: &State) -> Vec<(&BookId, Payload)> {
 /// are folded into the single `journal.jsonl`. The fold keeps exactly the state
 /// they held, so the library rebuilt from it is the same one.
 pub fn compact(dir: &Path) -> Result<Compact> {
-    let _lock = Lock::exclusive(&dir.join(".lock"))?;
-    let state = Journal::replay(dir)?;
-    let before = journal_lines(dir);
+    let _lock = Lock::exclusive(&dir.join(LOCK_FILE))?;
+    // One read of the folder: the state to fold and how much of it is being
+    // left behind come from the same events, rather than walking the files a
+    // second time just to count them.
+    let logs = read_events(dir)?;
+    let before = logs.iter().map(|log| log.events.len()).sum();
+    let state = fold(logs.into_iter().flat_map(|log| log.events).collect());
 
     let events = minimal(&state);
     let base = Utc::now();
@@ -652,14 +730,13 @@ pub fn compact(dir: &Path) -> Result<Compact> {
             book: book.as_str().to_string(),
             payload: payload.clone(),
         };
-        text.push_str(&serde_json::to_string(&event)?);
-        text.push('\n');
+        text.push_str(&event.line()?);
     }
 
     // Write beside the log and rename over it: a reader sees the old file or the
     // new one, never a half-written log. The temp name does not end in `.jsonl`,
     // so a crash that leaves it behind is ignored by `replay`.
-    let own = dir.join("journal.jsonl");
+    let own = dir.join(JOURNAL_FILE);
     let tmp = own.with_extension("tmp");
     {
         let mut file = OpenOptions::new()
@@ -680,10 +757,9 @@ pub fn compact(dir: &Path) -> Result<Compact> {
 
     // The older per-machine files are folded in; only the one file is read from
     // here on.
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path != own && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+    if let Ok(files) = journal_files(dir) {
+        for path in files {
+            if path != own {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -692,19 +768,6 @@ pub fn compact(dir: &Path) -> Result<Compact> {
         before,
         after: events.len(),
     })
-}
-
-/// The number of event lines in every journal in the folder.
-fn journal_lines(dir: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
-        .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
-        .sum()
 }
 
 /// What the journal folder holds, for `omaread journal status`.
@@ -736,51 +799,35 @@ pub fn status(dir: &Path) -> Result<Status> {
         bytes: 0,
         dead: 0,
     };
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(status),
-        Err(err) => return Err(err).with_context(|| format!("cannot read {}", dir.display())),
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let lines: Vec<String> = raw.lines().map(str::to_string).collect();
-        let newest = lines
-            .iter()
-            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
-            .map(|event| event.at)
-            .max();
-        status.events += lines.len();
-        status.bytes += raw.len() as u64;
+    let mut all = Vec::new();
+    for log in read_events(dir)? {
+        let count = log.events.len();
+        let newest = log.events.iter().map(|event| event.at).max();
+        status.events += count;
+        status.bytes += log.bytes;
         status.files.push(FileStatus {
-            name: path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            events: lines.len(),
-            bytes: raw.len() as u64,
+            name: log.name,
+            events: count,
+            bytes: log.bytes,
             newest,
         });
+        all.extend(log.events);
     }
     // What a fold would leave behind: the events the state itself needs.
-    let folded = minimal(&Journal::replay(dir)?).len();
+    let folded = minimal(&fold(all)).len();
     status.dead = status.events.saturating_sub(folded);
     Ok(status)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    /// A book id in the shape the program writes: `sha256:` and 64 hex digits, so
-    /// the tests exercise the same events a scan would write.
+    /// A book id in the shape the program writes: `sha256:` and 64 hex digits,
+    /// of the content an imagined book is made of, so the tests exercise the
+    /// same events a scan would write.
     fn id(seed: u8) -> BookId {
-        BookId::from(format!("sha256:{}", format!("{seed:02x}").repeat(32)))
+        BookId::from(crate::testkit::id_of_bytes(&[seed; 32]))
     }
 
     fn scratch(name: &str) -> crate::testkit::Scratch {
@@ -795,16 +842,20 @@ mod tests {
         }
     }
 
-    /// The journal this machine writes, read back after the given events.
-    fn written(name: &str, events: &[(&BookId, Payload)]) -> State {
-        let dir = scratch(name);
-        let mut journal = Journal::open(&dir).unwrap();
-        for (book, payload) in events {
-            journal.append(book, payload.clone()).unwrap();
-        }
-        let state = Journal::replay(&dir).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-        state
+    /// A book, as a scan would have written it: one event, for the tests that
+    /// drive the library off the journal.
+    pub(crate) fn seen(id: &str, title: &str, author: &str) -> (BookId, Event) {
+        let book = BookId::from(id.to_string());
+        let event = Event {
+            at: Utc::now(),
+            book: book.to_string(),
+            payload: Payload::BookSeen {
+                title: Some(title.into()),
+                authors: vec![author.into()],
+                path: PathBuf::from(format!("/books/{title}.epub")),
+            },
+        };
+        (book, event)
     }
 
     #[test]
@@ -831,7 +882,6 @@ mod tests {
             std::fs::read_to_string(file()).unwrap().lines().count(),
             1
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -849,14 +899,15 @@ mod tests {
         let legacy = dir.join("journal-box.jsonl");
         std::fs::write(
             &legacy,
-            "{\"at\":\"2099-01-01T00:00:00Z\",\"host\":\"box\",\"book\":\"sha256:0202020202020202020202020202020202020202020202020202020202020202\",\
-             \"type\":\"position_set\",\"href\":\"OEBPS/ch01.xhtml\",\"block\":99,\"offset\":3}\n",
+            format!(
+                "{{\"at\":\"2099-01-01T00:00:00Z\",\"host\":\"box\",\"book\":\"{book}\",\
+                 \"type\":\"position_set\",\"href\":\"OEBPS/ch01.xhtml\",\"block\":99,\"offset\":3}}\n",
+            ),
         )
         .unwrap();
 
         let state = Journal::replay(&dir).unwrap();
         assert_eq!(state.position(&book).map(|l| l.block), Some(99));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -866,21 +917,21 @@ mod tests {
         // the book again must not put the `dc:title` back: a correction is not a
         // gap waiting to be filled.
         let book = id(2);
-        let state = written(
+        let dir = journal_of(
             "cleared",
             &[
                 (
-                    &book,
+                    book.clone(),
                     Payload::BookSeen {
                         title: Some("一九七三年的弹子球".into()),
                         authors: vec!["村上春树".into()],
                         path: PathBuf::from("/books/a.epub"),
                     },
                 ),
-                (&book, meta("")),
+                (book.clone(), meta("")),
                 // Opened again: the same file, and no title of its own offered.
                 (
-                    &book,
+                    book.clone(),
                     Payload::BookSeen {
                         title: None,
                         authors: Vec::new(),
@@ -889,6 +940,7 @@ mod tests {
                 ),
             ],
         );
+        let state = Journal::replay(&dir).unwrap();
         let record = state.book(&book).expect("the book is in the library");
         assert_eq!(record.title, None, "the clear stands");
         assert_eq!(
@@ -941,7 +993,6 @@ mod tests {
             None,
             "and it comes back with nothing kept"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -974,87 +1025,81 @@ mod tests {
             state.book(&real).expect("the real book").display_title(),
             "Real"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn a_damaged_line_does_not_hide_the_others() {
-        let dir = scratch("damaged");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("journal-box.jsonl");
-        std::fs::write(
-            &file,
-            "not json at all\n\
-             {\"at\":\"2020-01-01T00:00:00Z\",\"host\":\"box\",\"book\":\"sha256:0202020202020202020202020202020202020202020202020202020202020202\",\
-             \"type\":\"position_set\",\"href\":\"c.xhtml\",\"block\":5,\"offset\":0}\n\
-             {\"at\":\"2020-01-01T00:00:01Z\",\"host\":\"box\",\"book\":\
-             \n",
-        )
-        .unwrap();
-
-        let state = Journal::replay(&dir).unwrap();
-        let book = id(2);
-        assert_eq!(state.position(&book).map(|l| l.block), Some(5));
-        std::fs::remove_dir_all(&dir).ok();
-    }
+    /// One damaged-journal case: the scratch's name, what is wrong with the
+    /// log, the log itself, and the books the replay must still hold.
+    type DamagedCase<'a> = (
+        &'a str,
+        &'a str,
+        String,
+        &'a [(&'a BookId, &'a str)],
+    );
 
     #[test]
-    fn an_event_this_version_no_longer_writes_is_skipped() {
-        // A journal written before highlighting was removed, and before the
-        // `file_missing` event went with it, still holds those events. The
-        // payload is no longer one this reader knows, so the line fails to
-        // parse and is skipped like any other unreadable line; the books
-        // around it must still replay.
-        let dir = scratch("old-event");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("journal-box.jsonl");
-        std::fs::write(
-            &file,
-            "{\"at\":\"2020-01-01T00:00:00Z\",\"host\":\"box\",\"book\":\"sha256:0101010101010101010101010101010101010101010101010101010101010101\",\
-             \"type\":\"book_seen\",\"title\":\"First\",\"authors\":[],\"path\":\"/books/a.epub\"}\n\
-             {\"at\":\"2020-01-01T00:00:01Z\",\"host\":\"box\",\"book\":\"sha256:0101010101010101010101010101010101010101010101010101010101010101\",\
-             \"type\":\"highlight_added\",\"id\":\"h-1\",\"href\":\"c.xhtml\",\
-             \"slices\":[{\"block\":1,\"start\":0,\"end\":4}],\"color\":\"yellow\",\"quote\":\"word\"}\n\
-             {\"at\":\"2020-01-01T00:00:02Z\",\"host\":\"box\",\"book\":\"sha256:0101010101010101010101010101010101010101010101010101010101010101\",\
-             \"type\":\"file_missing\",\"path\":\"/books/a.epub\"}\n\
-             {\"at\":\"2020-01-01T00:00:03Z\",\"host\":\"box\",\"book\":\"sha256:0303030303030303030303030303030303030303030303030303030303030303\",\
-             \"type\":\"book_seen\",\"title\":\"Second\",\"authors\":[],\"path\":\"/books/b.epub\"}\n",
-        )
-        .unwrap();
-
-        let state = Journal::replay(&dir).unwrap();
+    fn a_line_that_cannot_be_read_is_skipped_and_its_neighbours_replay() {
+        // A journal on disk can hold a line that is not JSON, one cut in half,
+        // an event this version no longer writes, or a key it no longer
+        // writes. Each such line costs only itself: every line around it
+        // still replays.
         let first = id(1);
         let second = id(3);
-        assert!(state.book(&first).is_some(), "the line before is replayed");
-        assert!(state.book(&second).is_some(), "the line after is replayed");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_line_naming_its_machine_still_loads() {
-        // Every line used to carry the machine it came from as a `host` key.
-        // The key is no longer written, but an old journal must keep loading: a
-        // key this version does not know is ignored, not refused.
-        let dir = scratch("old-host");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("journal-box.jsonl");
-        std::fs::write(
-            &file,
-            "{\"at\":\"2020-01-01T00:00:00Z\",\"host\":\"box\",\"book\":\"sha256:0101010101010101010101010101010101010101010101010101010101010101\",\
-             \"type\":\"book_seen\",\"title\":\"Old\",\"authors\":[],\"path\":\"/books/a.epub\"}\n",
-        )
-        .unwrap();
-
-        let state = Journal::replay(&dir).unwrap();
-        let book = id(1);
-        assert_eq!(
-            state
-                .book(&book)
-                .expect("the line is replayed")
-                .display_title(),
-            "Old"
-        );
-        std::fs::remove_dir_all(&dir).ok();
+        let line = |at: &str, book: &BookId, title: &str| {
+            format!(
+                "{{\"at\":\"2020-01-01T00:00:{at}Z\",\"host\":\"box\",\"book\":\"{book}\",\
+                 \"type\":\"book_seen\",\"title\":\"{title}\",\"authors\":[],\"path\":\"/books/{title}.epub\"}}\n"
+            )
+        };
+        let cases: [DamagedCase<'_>; 3] = [
+            (
+                "damaged-line",
+                "a line that is not JSON, and one cut in half",
+                format!(
+                    "not json at all\n{}{{\"at\":\"2020-01-01T00:00:01Z\",\"host\":\"box\",\"book\":\n{}",
+                    line("00", &first, "First"),
+                    line("03", &second, "Second"),
+                ),
+                &[(&first, "First"), (&second, "Second")],
+            ),
+            (
+                "old-events",
+                "events and keys this version no longer writes",
+                format!(
+                    "{}{{\"at\":\"2020-01-01T00:00:01Z\",\"host\":\"box\",\"book\":\"{first}\",\
+                     \"type\":\"highlight_added\",\"id\":\"h-1\",\"href\":\"c.xhtml\",\
+                     \"slices\":[{{\"block\":1,\"start\":0,\"end\":4}}],\"color\":\"yellow\",\"quote\":\"word\"}}\n\
+                     {{\"at\":\"2020-01-01T00:00:02Z\",\"host\":\"box\",\"book\":\"{first}\",\
+                     \"type\":\"file_missing\",\"path\":\"/books/First.epub\"}}\n{}",
+                    line("00", &first, "First"),
+                    line("03", &second, "Second"),
+                ),
+                &[(&first, "First"), (&second, "Second")],
+            ),
+            (
+                "old-host",
+                "a line naming the machine it came from",
+                line("00", &first, "Old"),
+                &[(&first, "Old")],
+            ),
+        ];
+        for (tag, name, text, expected) in cases {
+            let dir = scratch(tag);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("journal-box.jsonl"), text).unwrap();
+            let state = Journal::replay(&dir).unwrap();
+            assert_eq!(
+                state.books().count(),
+                expected.len(),
+                "{name}: an unreadable line was believed",
+            );
+            for (book, title) in expected {
+                assert_eq!(
+                    state.book(book).expect("the line is replayed").display_title(),
+                    *title,
+                    "{name}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -1104,7 +1149,6 @@ mod tests {
             0o600,
             "an old journal beside the log stays readable to all"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A `metadata_set` changing just the title.
@@ -1125,10 +1169,13 @@ mod tests {
     /// Writes events straight to this machine's file with increasing timestamps
     /// and returns the directory. `append`'s wall clock is not ordered enough to
     /// say which event came first.
-    fn journal_of(name: &str, events: &[(&BookId, Payload)]) -> crate::testkit::Scratch {
+    pub(crate) fn journal_of(
+        name: &str,
+        events: &[(BookId, Payload)],
+    ) -> crate::testkit::Scratch {
         let dir = scratch(name);
         Journal::open(&dir).unwrap();
-        let own = dir.join("journal.jsonl");
+        let own = dir.join(JOURNAL_FILE);
         let mut text = String::new();
         let base = Utc::now();
         for (index, (book, payload)) in events.iter().enumerate() {
@@ -1137,67 +1184,70 @@ mod tests {
                 book: book.as_str().to_string(),
                 payload: payload.clone(),
             };
-            text.push_str(&serde_json::to_string(&event).unwrap());
-            text.push('\n');
+            text.push_str(&event.line().unwrap());
         }
         std::fs::write(&own, text).unwrap();
         dir
     }
 
-    #[test]
-    fn compaction_keeps_the_state_and_drops_what_cannot_matter() {
+    /// The eight events the compaction test folds: a book forgotten and read
+    /// in again beside one that never was.
+    fn compaction_events() -> [(BookId, Payload); 8] {
         let a = id(1);
         let b = id(2);
-        let dir = journal_of(
-            "compact",
-            &[
-                // A was forgotten and read in again: its first life is dead.
-                (
-                    &a,
-                    Payload::BookSeen {
-                        title: Some("Old".into()),
-                        authors: vec!["X".into()],
-                        path: "/books/a.epub".into(),
-                    },
-                ),
-                (&a, meta("Corrected")),
-                (&a, Payload::BookForgotten),
-                (
-                    &a,
-                    Payload::BookSeen {
-                        title: Some("New".into()),
-                        authors: vec!["Y".into()],
-                        path: "/books/a.epub".into(),
-                    },
-                ),
-                (
-                    &a,
-                    Payload::PositionSet {
-                        href: "c1".into(),
-                        block: 1,
-                        offset: 0,
-                    },
-                ),
-                (
-                    &a,
-                    Payload::PositionSet {
-                        href: "c1".into(),
-                        block: 9,
-                        offset: 3,
-                    },
-                ),
-                // B was never forgotten: everything it did is kept.
-                (
-                    &b,
-                    Payload::BookSeen {
-                        title: Some("B".into()),
-                        authors: vec![],
-                        path: "/books/b.epub".into(),
-                    },
-                ),
-                (&b, meta("Bee")),
-            ],
-        );
+        [
+            // A was forgotten and read in again: its first life is dead.
+            (
+                a.clone(),
+                Payload::BookSeen {
+                    title: Some("Old".into()),
+                    authors: vec!["X".into()],
+                    path: "/books/a.epub".into(),
+                },
+            ),
+            (a.clone(), meta("Corrected")),
+            (a.clone(), Payload::BookForgotten),
+            (
+                a.clone(),
+                Payload::BookSeen {
+                    title: Some("New".into()),
+                    authors: vec!["Y".into()],
+                    path: "/books/a.epub".into(),
+                },
+            ),
+            (
+                a.clone(),
+                Payload::PositionSet {
+                    href: "c1".into(),
+                    block: 1,
+                    offset: 0,
+                },
+            ),
+            (
+                a,
+                Payload::PositionSet {
+                    href: "c1".into(),
+                    block: 9,
+                    offset: 3,
+                },
+            ),
+            // B was never forgotten: everything it did is kept.
+            (
+                b.clone(),
+                Payload::BookSeen {
+                    title: Some("B".into()),
+                    authors: vec![],
+                    path: "/books/b.epub".into(),
+                },
+            ),
+            (b, meta("Bee")),
+        ]
+    }
+
+    #[test]
+    fn compaction_keeps_the_state_and_drops_what_cannot_matter() {
+        let (a, b) = (id(1), id(2));
+        let dir = journal_of("compact", &compaction_events());
 
         let before = Journal::replay(&dir).unwrap();
         let report = compact(&dir).unwrap();
@@ -1225,7 +1275,6 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(folded, std::fs::metadata(dir.join("journal.jsonl")).unwrap().len());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1246,11 +1295,7 @@ mod tests {
             },
         };
         let legacy = dir.join("journal-box.jsonl");
-        std::fs::write(
-            &legacy,
-            format!("{}\n", serde_json::to_string(&event).unwrap()),
-        )
-        .unwrap();
+        std::fs::write(&legacy, event.line().unwrap()).unwrap();
         let before = Journal::replay(&dir).unwrap();
 
         compact(&dir).unwrap();
@@ -1261,6 +1306,88 @@ mod tests {
             after.book(&a).map(|r| r.display_title()),
             before.book(&a).map(|r| r.display_title())
         );
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn status_counts_events_and_dead_lines_the_way_a_fold_would() {
+        // What `journal status` reports and what a fold would actually shed
+        // must come from the same reading of the folder: a blank line is not an
+        // event, nor is one nothing could parse, so neither a count of events
+        // nor the number said to be dead may include them.
+        let dir = scratch("status");
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = id(2);
+        let newest = Event {
+            at: Utc::now() + chrono::TimeDelta::seconds(3),
+            book: book.as_str().to_string(),
+            payload: meta("Corrected"),
+        };
+        let seen = Event {
+            at: Utc::now(),
+            book: book.as_str().to_string(),
+            payload: Payload::BookSeen {
+                title: Some("First Guess".into()),
+                authors: vec!["Someone".into()],
+                path: "/books/a.epub".into(),
+            },
+        };
+        let first = Event {
+            at: Utc::now() + chrono::TimeDelta::seconds(1),
+            book: book.as_str().to_string(),
+            payload: Payload::PositionSet {
+                href: "c.xhtml".into(),
+                block: 3,
+                offset: 1,
+            },
+        };
+        let last = Event {
+            at: Utc::now() + chrono::TimeDelta::seconds(2),
+            book: book.as_str().to_string(),
+            payload: Payload::PositionSet {
+                href: "c.xhtml".into(),
+                block: 4,
+                offset: 2,
+            },
+        };
+        std::fs::write(
+            dir.join("journal-box.jsonl"),
+            format!(
+                "\n{}{}\nnot json at all\n{}{}",
+                seen.line().unwrap(),
+                first.line().unwrap(),
+                last.line().unwrap(),
+                newest.line().unwrap()
+            ),
+        )
+        .unwrap();
+
+        let report = status(&dir).unwrap();
+        assert_eq!(report.events, 4, "only the lines that are events");
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].events, 4);
+        assert_eq!(
+            report.bytes,
+            std::fs::metadata(dir.join("journal-box.jsonl"))
+                .unwrap()
+                .len(),
+            "bytes are the file as it sits"
+        );
+        assert_eq!(
+            report.files[0].newest,
+            Some(newest.at),
+            "the newest event"
+        );
+        // A fold keeps the book, its correction and the newest position: the
+        // first position is history, and it is the one line that no longer
+        // matters.
+        assert_eq!(report.dead, 1);
+
+        // A folder that is not there yet holds nothing, and is not an error:
+        // reporting on it happens before anything has been read.
+        let missing = scratch("status-missing");
+        let report = status(&missing).unwrap();
+        assert!(report.files.is_empty());
+        assert_eq!(report.events, 0);
+        assert_eq!(report.dead, 0);
     }
 }

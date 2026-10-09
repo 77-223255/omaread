@@ -10,6 +10,7 @@
 //! `identity`.
 
 use crate::epub::Book;
+use crate::i18n;
 use crate::identity::BookId;
 use crate::journal::{BookRecord, Journal, Payload, State};
 use anyhow::{Result, bail};
@@ -25,9 +26,10 @@ pub struct Entry {
 /// The one sentence for a reference that picked out no book.
 ///
 /// The table, the search, the shelf and the error a command fails with all say
-/// it this way, so there is one spelling of "nothing matched" to read.
+/// it this way, so there is one spelling of "nothing matched" to read — through
+/// the one lookup, so shelf and command line say it in the same language.
 pub fn no_match(needle: &str) -> String {
-    format!("no book matches {needle}")
+    i18n::fill("no book matches {}", &[&needle])
 }
 
 /// How long a prefix of an id may be before it counts as one.
@@ -42,27 +44,16 @@ const MIN_PREFIX: usize = 8;
 /// already tell every id apart; the width only grows when two share that much.
 const SHORT_PREFIX: usize = 12;
 
-/// How the list is ordered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Order {
-    Title,
-    Author,
-}
-
-impl Order {
-    pub fn label(self) -> &'static str {
-        match self {
-            Order::Title => "title",
-            Order::Author => "author",
-        }
-    }
-
-    pub fn next(self) -> Self {
-        match self {
-            Order::Title => Order::Author,
-            Order::Author => Order::Title,
-        }
-    }
+/// One author's shelf: the name as the books record it, and the books it names.
+///
+/// The books are positions into the entries the shelf already holds, so a
+/// grouping copies names and indices rather than cloning the books behind them.
+#[derive(Debug, Clone)]
+pub struct Author {
+    /// `None` for the books that name nobody — one group for all of them,
+    /// parked at the end where no name sorts.
+    pub name: Option<String>,
+    pub books: Vec<usize>,
 }
 
 /// The title a file name suggests.
@@ -137,9 +128,9 @@ pub fn resolve(state: &State, needle: &str) -> Result<BookId> {
     let matches = filter(&all, wanted);
     match matches.len() {
         0 => bail!("{}", no_match(needle)),
-        1 => Ok(matches[0].id.clone()),
+        1 => Ok(all[matches[0]].id.clone()),
         _ => {
-            let listed: Vec<&Entry> = matches.iter().collect();
+            let listed: Vec<&Entry> = matches.iter().map(|&index| &all[index]).collect();
             // A one-letter needle matches most of a library, and a wall of names
             // is not an answer to anything. Ten says what shape the problem is.
             bail!(
@@ -212,32 +203,131 @@ pub fn entries(state: &State) -> Vec<Entry> {
         .collect()
 }
 
-/// Sorts a list in place.
-pub fn sort(entries: &mut [Entry], order: Order) {
-    match order {
-        Order::Title => entries.sort_by_key(|e| sortable(&e.record.display_title())),
-        Order::Author => entries.sort_by(|a, b| {
-            // A book without an author belongs at the end, not in front of
-            // everything: its placeholder would otherwise sort before the letters.
-            let key = |e: &Entry| {
-                e.record
-                    .authors
-                    .first()
-                    .filter(|name| !name.trim().is_empty())
-                    .map(|name| sortable(name))
-            };
-            match (key(a), key(b)) {
-                (Some(x), Some(y)) => x.cmp(&y).then_with(|| {
-                    sortable(&a.record.display_title()).cmp(&sortable(&b.record.display_title()))
-                }),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => {
-                    sortable(&a.record.display_title()).cmp(&sortable(&b.record.display_title()))
-                }
+/// Sorts a whole library in place: first author, then title, and the books
+/// that name nobody last.
+///
+/// The one order anything that prints every book uses — the shelf browses in
+/// it and `omaread list` prints in it, so a list read on the terminal and a
+/// shelf opened on it agree about what comes first.
+pub fn sort_books(entries: &mut [Entry]) {
+    entries.sort_by(|a, b| {
+        // A book without an author belongs at the end, not in front of
+        // everything: its placeholder would otherwise sort before the letters.
+        let key = |e: &Entry| {
+            e.record
+                .authors
+                .first()
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| sortable(name))
+        };
+        match (key(a), key(b)) {
+            (Some(x), Some(y)) => x.cmp(&y).then_with(|| {
+                sortable(&a.record.display_title()).cmp(&sortable(&b.record.display_title()))
+            }),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => {
+                sortable(&a.record.display_title()).cmp(&sortable(&b.record.display_title()))
             }
-        }),
+        }
+    })
+}
+
+/// Every author on the shelf, alphabetical, with the nameless group last.
+///
+/// A book is filed under its *first* author and no other: a book written by
+/// several would otherwise sit in every list at once, and the first name is
+/// the one that names it on the cover. The group's books arrive sorted by
+/// title, so one shelf level needs no second ordering of its own.
+pub fn authors(entries: &[Entry]) -> Vec<Author> {
+    let mut groups: Vec<Author> = Vec::new();
+    // The name as written is the key, so one spelling of a name is one row and
+    // the mess of spellings stays visible for `omaread authors` to fix.
+    let mut by_name: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut nameless: Option<usize> = None;
+
+    for (index, entry) in entries.iter().enumerate() {
+        let first = entry
+            .record
+            .authors
+            .first()
+            .map(String::as_str)
+            .filter(|name| !name.trim().is_empty());
+        let group = match first {
+            Some(name) => match by_name.get(name) {
+                Some(&group) => group,
+                None => {
+                    groups.push(Author {
+                        name: Some(name.to_string()),
+                        books: Vec::new(),
+                    });
+                    by_name.insert(name, groups.len() - 1);
+                    groups.len() - 1
+                }
+            },
+            // One group for every book with no author, however many there are.
+            None => *nameless.get_or_insert_with(|| {
+                groups.push(Author {
+                    name: None,
+                    books: Vec::new(),
+                });
+                groups.len() - 1
+            }),
+        };
+        groups[group].books.push(index);
     }
+
+    groups.sort_by(|a, b| match (&a.name, &b.name) {
+        (Some(x), Some(y)) => sortable(x).cmp(&sortable(y)),
+        // The nameless group has no name to sort with, so it trails the rest
+        // rather than borrowing a placeholder that would file it under a letter.
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    for group in &mut groups {
+        // Cached: the lowercase key would otherwise be built again for every
+        // comparison, once per pair in a large library.
+        group
+            .books
+            .sort_by_cached_key(|&index| sortable(&entries[index].record.display_title()));
+    }
+    groups
+}
+
+/// The positions in `authors` of the names a word picks out, in list order.
+///
+/// The same folding the book filter does — trimmed, lowercased, a name the
+/// word starts ahead of one it only hides inside — so a word that finds an
+/// author here finds the same author's books in `filter`. The nameless group
+/// has no name to look in, and a word never picks it.
+pub fn filter_authors(authors: &[Author], needle: &str) -> Vec<usize> {
+    if needle.trim().is_empty() {
+        return (0..authors.len()).collect();
+    }
+    let needle = needle.trim().to_lowercase();
+    // Lowercased once per name rather than once per pass over them.
+    let names: Vec<Option<String>> = authors
+        .iter()
+        .map(|author| author.name.as_ref().map(|name| name.to_lowercase()))
+        .collect();
+
+    let at_word_start: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.as_deref().is_some_and(|name| starts_a_word(name, &needle)))
+        .map(|(index, _)| index)
+        .collect();
+    if !at_word_start.is_empty() {
+        return at_word_start;
+    }
+
+    names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.as_deref().is_some_and(|name| name.contains(&needle)))
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// Sort key: lowercase, and a leading article dropped so "The Hobbit" files
@@ -252,7 +342,7 @@ fn sortable(text: &str) -> String {
     lower
 }
 
-/// The books a word picks out.
+/// The positions in `entries` of the books a word picks out, in list order.
 ///
 /// This is the one matcher in the program: `list --filter`, `show`,
 /// `omaread BOOK` and `forget` all come through it, so a word that
@@ -260,29 +350,36 @@ fn sortable(text: &str) -> String {
 /// title, the authors, the series and the tags, and puts the books whose fields
 /// *start* with the word first — which is what a person means when they type the
 /// first letters of a title.
-pub fn filter(entries: &[Entry], needle: &str) -> Vec<Entry> {
+///
+/// Answers with positions rather than copies of the books: every caller
+/// already holds the list — a shelf re-filtering while a key is held down, a
+/// command printing a table — and copying the matches out would clone the
+/// library per call to learn which of its own rows were picked.
+pub fn filter(entries: &[Entry], needle: &str) -> Vec<usize> {
     if needle.trim().is_empty() {
-        return entries.to_vec();
+        return (0..entries.len()).collect();
     }
     let needle = needle.trim().to_lowercase();
+    // Lowercased once per book, not once per pass: the word-start pass and the
+    // fallback look at the same four fields, and a book matched nowhere built
+    // them twice for nothing.
+    let fields: Vec<[String; 4]> = entries.iter().map(fields_of).collect();
 
-    let at_word_start: Vec<Entry> = entries
+    let at_word_start: Vec<usize> = fields
         .iter()
-        .filter(|entry| {
-            fields_of(entry)
-                .iter()
-                .any(|text| starts_a_word(text, &needle))
-        })
-        .cloned()
+        .enumerate()
+        .filter(|(_, fields)| fields.iter().any(|text| starts_a_word(text, &needle)))
+        .map(|(index, _)| index)
         .collect();
     if !at_word_start.is_empty() {
         return at_word_start;
     }
 
-    entries
+    fields
         .iter()
-        .filter(|entry| fields_of(entry).iter().any(|text| text.contains(&needle)))
-        .cloned()
+        .enumerate()
+        .filter(|(_, fields)| fields.iter().any(|text| text.contains(&needle)))
+        .map(|(index, _)| index)
         .collect()
 }
 
@@ -461,23 +558,8 @@ fn is_book(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::{Event, Payload, State};
-    use chrono::Utc;
-
-    /// A book, as a scan would have written it.
-    fn seen(id: &str, title: &str, author: &str) -> (crate::identity::BookId, Event) {
-        let book = crate::identity::BookId::from(id.to_string());
-        let event = Event {
-            at: Utc::now(),
-            book: book.to_string(),
-            payload: Payload::BookSeen {
-                title: Some(title.into()),
-                authors: vec![author.into()],
-                path: std::path::PathBuf::from(format!("/books/{title}.epub")),
-            },
-        };
-        (book, event)
-    }
+    use crate::journal::State;
+    use crate::journal::tests::seen;
 
     #[test]
     fn naming_a_book_answers_with_one_book_or_says_which() {
@@ -518,8 +600,13 @@ mod tests {
 
         // Below the minimum, an id-shaped word is nothing but a word: it goes
         // through the matcher like any title, and answers when nothing fits.
+        // The sentence is looked up rather than spelled out, so the assertion
+        // reads the same on a machine set to any language.
         let err = resolve(&state, "sha256").unwrap_err().to_string();
-        assert!(err.contains("no book matches sha256"), "{err}");
+        assert!(
+            err.contains(&i18n::fill("no book matches {}", &[&"sha256"])),
+            "{err}"
+        );
 
         // A prefix two books share is not an answer — each is named by a
         // prefix that tells them apart, and one more character is an answer.
@@ -565,10 +652,10 @@ mod tests {
         }
     }
 
-    fn entry(title: &str, author: &str, series: Option<&str>, index: Option<f32>) -> Entry {
+    fn entry(title: &str, authors: &[&str], series: Option<&str>, index: Option<f32>) -> Entry {
         let mut record = BookRecord::new(PathBuf::from("/tmp/x.epub"));
         record.title = Some(title.into());
-        record.authors = vec![author.into()];
+        record.authors = authors.iter().map(|name| (*name).to_string()).collect();
         record.series = series.map(String::from);
         record.series_index = index;
         Entry {
@@ -578,37 +665,98 @@ mod tests {
     }
 
     #[test]
-    fn sorts_by_title_ignoring_a_leading_article() {
+    fn authors_are_grouped_alphabetically_with_the_nameless_one_last() {
+        let list = vec![
+            entry("Zebra", &["Zena"], None, None),
+            entry("Apple", &["Adam"], None, None),
+            entry("Mango", &["Mid"], None, None),
+            entry("Anonymous", &[], None, None),
+        ];
+        let groups = authors(&list);
+        let names: Vec<Option<&str>> = groups.iter().map(|group| group.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            vec![Some("Adam"), Some("Mid"), Some("Zena"), None],
+            "alphabetically, and nobody at the end"
+        );
+        // Every authorless book lands in the one group, not one each.
+        assert_eq!(groups[3].books, vec![3]);
+    }
+
+    #[test]
+    fn a_book_is_filed_under_its_first_author_only() {
+        // A book by two people is one book: listing it under both would show it
+        // twice on a shelf that only ever holds it once.
+        let list = vec![
+            entry("Good Omens", &["Terry Pratchett", "Neil Gaiman"], None, None),
+            entry("American Gods", &["Neil Gaiman"], None, None),
+        ];
+        let groups = authors(&list);
+        let names: Vec<Option<&str>> = groups.iter().map(|group| group.name.as_deref()).collect();
+        assert_eq!(names, vec![Some("Neil Gaiman"), Some("Terry Pratchett")]);
+        assert_eq!(groups[0].books, vec![1], "only the book that says so");
+        assert_eq!(groups[1].books, vec![0], "the other sits under the first name");
+    }
+
+    #[test]
+    fn an_authors_books_come_by_title_ignoring_a_leading_article() {
         assert_eq!(sortable("The Hobbit"), "hobbit");
         assert_eq!(sortable("Die Verwandlung"), "verwandlung");
         assert_eq!(sortable("Anathem"), "anathem");
 
-        let mut list = vec![
-            entry("Zero to Sold", "Bechtel", None, None),
-            entry("The Hobbit", "Tolkien", None, None),
+        let list = vec![
+            entry("Zebra", &["Tolkien"], None, None),
+            entry("Anathem", &["Stephenson"], None, None),
+            entry("The Hobbit", &["Tolkien"], None, None),
         ];
-        sort(&mut list, Order::Title);
-        assert_eq!(list[0].record.title.as_deref(), Some("The Hobbit"));
+        let groups = authors(&list);
+        let names: Vec<Option<&str>> = groups.iter().map(|group| group.name.as_deref()).collect();
+        assert_eq!(names, vec![Some("Stephenson"), Some("Tolkien")]);
+        // "The Hobbit" files under H, ahead of Zebra — an article is not a letter.
+        assert_eq!(groups[1].books, vec![2, 0]);
     }
 
     #[test]
-    fn a_book_without_the_field_sorted_on_comes_last() {
-        let mut nameless = entry("Zzz Anonymous", "", None, None);
-        nameless.record.authors.clear();
-        let mut list = vec![nameless, entry("Anathem", "Stephenson", None, None)];
-        sort(&mut list, Order::Author);
-        assert_eq!(
-            list[0].record.authors.first().map(String::as_str),
-            Some("Stephenson")
-        );
+    fn the_author_filter_finds_names_the_way_the_book_filter_does() {
+        let list = vec![
+            entry("Norwegian Wood", &["Haruki Murakami"], None, None),
+            entry("A Wizard of Earthsea", &["Ursula K. Le Guin"], None, None),
+            entry("Anonymous", &[], None, None),
+        ];
+        let groups = authors(&list);
+
+        // Case is folded away, and a word a name starts with comes first —
+        // the same two passes `filter` runs over the books.
+        assert_eq!(filter_authors(&groups, "MURAKAMI"), vec![0]);
+        assert_eq!(filter_authors(&groups, "guin"), vec![1]);
+        assert_eq!(filter_authors(&groups, ""), vec![0, 1, 2], "no word keeps everyone");
+        assert!(filter_authors(&groups, "zzz").is_empty());
+        // The nameless group has no name to match, so a word never picks it.
+        assert!(!filter_authors(&groups, "a").contains(&2));
+    }
+
+    #[test]
+    fn sort_books_ranks_by_author_then_title_with_the_nameless_last() {
+        let mut list = vec![
+            entry("Zebra", &["Tolkien"], None, None),
+            entry("Anonymous", &[], None, None),
+            entry("The Hobbit", &["Tolkien"], None, None),
+            entry("Anathem", &["Stephenson"], None, None),
+        ];
+        sort_books(&mut list);
+        let order: Vec<&str> = list
+            .iter()
+            .map(|entry| entry.record.title.as_deref().unwrap())
+            .collect();
+        assert_eq!(order, vec!["Anathem", "The Hobbit", "Zebra", "Anonymous"]);
     }
 
     #[test]
     fn a_filter_matches_anywhere_in_any_field() {
-        let mut tagged = entry("Anathem", "Stephenson", None, None);
+        let mut tagged = entry("Anathem", &["Stephenson"], None, None);
         tagged.record.tags = vec!["science fiction".into()];
         let list = vec![
-            entry("The Hobbit", "Tolkien", Some("Middle-earth"), Some(1.0)),
+            entry("The Hobbit", &["Tolkien"], Some("Middle-earth"), Some(1.0)),
             tagged,
         ];
         assert_eq!(filter(&list, "hobbit").len(), 1);
@@ -621,16 +769,16 @@ mod tests {
         // A match that starts a word beats one hiding inside another word,
         // and a word nothing starts with still finds what it hides inside.
         let list = vec![
-            entry("Practical Fraud Prevention", "Saporta", None, None),
-            entry("Understanding Eventsourcing", "Dilger", None, None),
+            entry("Practical Fraud Prevention", &["Saporta"], None, None),
+            entry("Understanding Eventsourcing", &["Dilger"], None, None),
         ];
         let found = filter(&list, "event");
         assert_eq!(found.len(), 1);
         assert_eq!(
-            found[0].record.title.as_deref(),
+            list[found[0]].record.title.as_deref(),
             Some("Understanding Eventsourcing")
         );
-        let list = vec![entry("Understanding Eventsourcing", "Dilger", None, None)];
+        let list = vec![entry("Understanding Eventsourcing", &["Dilger"], None, None)];
         assert_eq!(filter(&list, "sourcing").len(), 1);
     }
 
